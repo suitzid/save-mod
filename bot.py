@@ -1,234 +1,203 @@
-import logging
 import os
+import html
 import sqlite3
-import time
+import hashlib
+import logging
 
-from aiogram import Bot, Dispatcher
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
-
-# --- Конфигурация из переменных окружения ---
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-# Render автоматически подставляет RENDER_EXTERNAL_URL, например https://mybot.onrender.com
-# Если переменной нет (локальный запуск), можно задать WEBHOOK_URL вручную.
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")  # опционально, но рекомендуется
-
-# Порт: Render требует, чтобы приложение слушало порт из переменной PORT
-PORT = int(os.environ.get("PORT", 8080))
-HOST = "0.0.0.0"
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    BusinessConnection,
+    BusinessMessagesDeleted,
+)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=BOT_TOKEN)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+BASE_URL = os.environ.get("WEBHOOK_BASE_URL") or os.environ["RENDER_EXTERNAL_URL"]
+PORT = int(os.environ.get("PORT", 10000))
+WEBHOOK_PATH = "/webhook"
+SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-DB_PATH = "saved_messages.db"
+# ---------- БД (sqlite; на бесплатном Render диск стирается при рестарте) ----------
+db = sqlite3.connect("data.db", check_same_thread=False)
+db.executescript(
+    """
+CREATE TABLE IF NOT EXISTS connections (
+    id TEXT PRIMARY KEY,
+    owner_chat_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    conn_id TEXT,
+    chat_id INTEGER,
+    msg_id INTEGER,
+    sender_id INTEGER,
+    sender_name TEXT,
+    text TEXT,
+    media_type TEXT,
+    file_id TEXT,
+    PRIMARY KEY (conn_id, chat_id, msg_id)
+);
+"""
+)
+db.commit()
+
+MEDIA_SENDERS = {
+    "photo": bot.send_photo,
+    "video": bot.send_video,
+    "voice": bot.send_voice,
+    "video_note": bot.send_video_note,
+    "document": bot.send_document,
+    "audio": bot.send_audio,
+    "animation": bot.send_animation,
+    "sticker": bot.send_sticker,
+}
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            business_connection_id TEXT,
-            chat_id INTEGER,
-            message_id INTEGER,
-            from_id INTEGER,
-            from_name TEXT,
-            text TEXT,
-            photo_file_id TEXT,
-            saved_at INTEGER,
-            PRIMARY KEY (business_connection_id, chat_id, message_id)
-        )
-        """
+def extract_media(m: Message):
+    if m.photo:
+        return "photo", m.photo[-1].file_id
+    for t in ("video", "voice", "video_note", "document", "audio", "animation", "sticker"):
+        obj = getattr(m, t, None)
+        if obj:
+            return t, obj.file_id
+    return None, None
+
+
+def owner_of(conn_id: str):
+    row = db.execute("SELECT owner_chat_id FROM connections WHERE id=?", (conn_id,)).fetchone()
+    return row[0] if row else None
+
+
+def who(name: str, uid: int) -> str:
+    return f'<a href="tg://user?id={uid}">{html.escape(name)}</a>'
+
+
+# ---------- хендлеры ----------
+@dp.message(CommandStart())
+async def start(m: Message):
+    await m.answer(
+        "👋 Я сохраняю удалённые и изменённые сообщения.\n\n"
+        "Подключение: <b>Настройки → Telegram для бизнеса → Чат-боты</b> → "
+        "выбери меня и дай доступ к чатам."
     )
-    # Таблица связи: какое business_connection_id кому принадлежит
-    # (т.е. какому пользователю Telegram слать уведомления об удалении
-    # в чатах, подключённых через ЭТО соединение).
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS connections (
-            business_connection_id TEXT PRIMARY KEY,
-            owner_user_id INTEGER,
-            is_enabled INTEGER,
-            updated_at INTEGER
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def upsert_connection(business_connection_id, owner_user_id, is_enabled):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO connections
-        (business_connection_id, owner_user_id, is_enabled, updated_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (business_connection_id, owner_user_id, int(is_enabled), int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_connection_owner(business_connection_id):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT owner_user_id, is_enabled FROM connections WHERE business_connection_id = ?",
-        (business_connection_id,),
-    ).fetchone()
-    conn.close()
-    return row  # (owner_user_id, is_enabled) или None
-
-
-def save_message(business_connection_id, chat_id, message_id, from_id, from_name, text, photo_file_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO messages
-        (business_connection_id, chat_id, message_id, from_id, from_name, text, photo_file_id, saved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (business_connection_id, chat_id, message_id, from_id, from_name, text, photo_file_id, int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_messages(business_connection_id, chat_id, message_ids):
-    conn = sqlite3.connect(DB_PATH)
-    placeholders = ",".join("?" * len(message_ids))
-    rows = conn.execute(
-        f"""
-        SELECT message_id, from_name, text, photo_file_id
-        FROM messages
-        WHERE business_connection_id = ? AND chat_id = ? AND message_id IN ({placeholders})
-        """,
-        (business_connection_id, chat_id, *message_ids),
-    ).fetchall()
-    conn.close()
-    return rows
 
 
 @dp.business_connection()
-async def on_business_connection(connection):
-    """
-    Срабатывает, когда ЛЮБОЙ пользователь подключает или отключает этого бота
-    в Настройки -> Telegram для бизнеса -> Чат-боты. Здесь мы запоминаем,
-    какой business_connection_id принадлежит какому Telegram-пользователю —
-    это и есть ключ мульти-пользовательской работы: у каждого подключившегося
-    свой owner_user_id, и уведомления уходят именно ему, а не одному жёстко
-    заданному человеку.
-    """
-    upsert_connection(
-        business_connection_id=connection.id,
-        owner_user_id=connection.user.id,
-        is_enabled=connection.is_enabled,
-    )
-    logging.info(
-        f"Business connection {'включено' if connection.is_enabled else 'выключено'}: "
-        f"{connection.id} -> владелец {connection.user.id} ({connection.user.full_name})"
-    )
-    if connection.is_enabled:
-        await bot.send_message(
-            connection.user.id,
-            "✅ Бот подключён к вашему аккаунту. Теперь, если в ваших личных "
-            "чатах кто-то удалит сообщение, я пришлю вам его копию здесь.",
+async def on_connection(c: BusinessConnection):
+    if c.is_enabled:
+        db.execute(
+            "INSERT OR REPLACE INTO connections VALUES (?, ?)", (c.id, c.user_chat_id)
         )
+        db.commit()
+        await bot.send_message(c.user_chat_id, "✅ Подключено. Слежу за чатами.")
+    else:
+        db.execute("DELETE FROM connections WHERE id=?", (c.id,))
+        db.commit()
 
 
 @dp.business_message()
-async def on_business_message(message):
-    """Сохраняем каждое сообщение (своё и собеседника) в бизнес-чате сразу, как оно пришло."""
-    photo_file_id = message.photo[-1].file_id if message.photo else None
-    save_message(
-        business_connection_id=message.business_connection_id,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-        from_id=message.from_user.id if message.from_user else None,
-        from_name=message.from_user.full_name if message.from_user else "Неизвестно",
-        text=message.text or message.caption,
-        photo_file_id=photo_file_id,
+async def on_business_message(m: Message):
+    mtype, file_id = extract_media(m)
+    sender = m.from_user
+    db.execute(
+        "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?)",
+        (
+            m.business_connection_id,
+            m.chat.id,
+            m.message_id,
+            sender.id if sender else 0,
+            sender.full_name if sender else "?",
+            m.text or m.caption or "",
+            mtype,
+            file_id,
+        ),
     )
+    db.commit()
+
+
+@dp.edited_business_message()
+async def on_edit(m: Message):
+    owner = owner_of(m.business_connection_id)
+    row = db.execute(
+        "SELECT sender_id, sender_name, text FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=?",
+        (m.business_connection_id, m.chat.id, m.message_id),
+    ).fetchone()
+    new_text = m.text or m.caption or ""
+
+    if owner and row and row[0] != owner:  # не уведомляем о правках самого владельца
+        await bot.send_message(
+            owner,
+            f"✏️ {who(row[1], row[0])} изменил(а) сообщение\n\n"
+            f"<b>Было:</b>\n{html.escape(row[2] or '—')}\n\n"
+            f"<b>Стало:</b>\n{html.escape(new_text or '—')}",
+        )
+
+    mtype, file_id = extract_media(m)
+    db.execute(
+        "UPDATE messages SET text=?, media_type=COALESCE(?, media_type), file_id=COALESCE(?, file_id) "
+        "WHERE conn_id=? AND chat_id=? AND msg_id=?",
+        (new_text, mtype, file_id, m.business_connection_id, m.chat.id, m.message_id),
+    )
+    db.commit()
 
 
 @dp.deleted_business_messages()
-async def on_deleted_business_messages(event):
-    """
-    Срабатывает при удалении сообщения в чате, подключённом через бизнес-режим.
-    Определяем владельца именно этого business_connection_id и шлём уведомление
-    только ему — у другого подключившегося пользователя будут свои события
-    со своим business_connection_id и своим owner_user_id.
-    """
-    owner = get_connection_owner(event.business_connection_id)
-    if not owner or not owner[1]:
-        logging.warning(f"Нет владельца или соединение выключено: {event.business_connection_id}")
+async def on_deleted(d: BusinessMessagesDeleted):
+    owner = owner_of(d.business_connection_id)
+    if not owner:
         return
-    owner_user_id = owner[0]
+    for mid in d.message_ids:
+        row = db.execute(
+            "SELECT sender_id, sender_name, text, media_type, file_id FROM messages "
+            "WHERE conn_id=? AND chat_id=? AND msg_id=?",
+            (d.business_connection_id, d.chat.id, mid),
+        ).fetchone()
+        if not row or row[0] == owner:
+            continue
+        uid, name, text, mtype, file_id = row
+        caption = f"🗑 {who(name, uid)} удалил(а) сообщение"
+        if text:
+            caption += f"\n\n{html.escape(text)}"
+        try:
+            sender = MEDIA_SENDERS.get(mtype)
+            if sender and file_id:
+                if mtype in ("video_note", "sticker"):
+                    await sender(owner, file_id)
+                    await bot.send_message(owner, caption)
+                else:
+                    await sender(owner, file_id, caption=caption)
+            else:
+                await bot.send_message(owner, caption)
+        except Exception:
+            logging.exception("failed to forward deleted message")
 
-    rows = get_messages(event.business_connection_id, event.chat.id, event.message_ids)
 
-    if not rows:
-        await bot.send_message(
-            owner_user_id,
-            f"⚠️ Удалено сообщение в чате {event.chat.id}, но копия не найдена в базе "
-            f"(возможно, бот не успел его сохранить до удаления).",
-        )
-        return
-
-    for message_id, from_name, text, photo_file_id in rows:
-        caption = f"🗑 Удалённое сообщение\nОт: {from_name}\nЧат: {event.chat.id}\n\n{text or ''}"
-        if photo_file_id:
-            await bot.send_photo(owner_user_id, photo_file_id, caption=caption)
-        else:
-            await bot.send_message(owner_user_id, caption)
-
-
+# ---------- веб-сервер ----------
 async def on_startup(bot: Bot):
-    """Устанавливаем вебхук при старте приложения."""
-    base_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
-    if not base_url:
-        raise RuntimeError(
-            "Не удалось определить URL для вебхука. "
-            "Задайте переменную WEBHOOK_URL или запустите на Render (RENDER_EXTERNAL_URL)."
-        )
-    webhook_url = f"{base_url.rstrip('/')}{WEBHOOK_PATH}"
-
     await bot.set_webhook(
-        webhook_url,
-        secret_token=WEBHOOK_SECRET,
+        f"{BASE_URL.rstrip('/')}{WEBHOOK_PATH}",
+        secret_token=SECRET,
+        allowed_updates=dp.resolve_used_update_types(),
         drop_pending_updates=True,
     )
-    logging.info(f"Вебхук установлен: {webhook_url}")
-
-
-async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
-    logging.info("Вебхук удалён.")
 
 
 def main():
-    init_db()
-
     dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
     app = web.Application()
-
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=WEBHOOK_SECRET,
-    )
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    SimpleRequestHandler(dp, bot, secret_token=SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-
-    web.run_app(app, host=HOST, port=PORT)
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
