@@ -5,7 +5,19 @@ import sqlite3
 import time
 
 from aiogram import Bot, Dispatcher
+from aiohttp import web
 
+async def health(request):
+    return web.Response(text="ok")
+
+async def main():
+    init_db()
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await dp.start_polling(bot)
 # Токен и ID берутся из переменных окружения — никогда не хранить их в коде.
 # Локально: создайте файл .env рядом (см. .env.example) и запускайте через
 # `python -m dotenv run -- python save_mod_bot.py`, либо экспортируйте
