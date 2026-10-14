@@ -5,26 +5,21 @@ import sqlite3
 import time
 
 from aiogram import Bot, Dispatcher
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-async def health(request):
-    return web.Response(text="ok")
-
-async def main():
-    init_db()
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
-    await dp.start_polling(bot)
-# Токен и ID берутся из переменных окружения — никогда не хранить их в коде.
-# Локально: создайте файл .env рядом (см. .env.example) и запускайте через
-# `python -m dotenv run -- python save_mod_bot.py`, либо экспортируйте
-# переменные в терминале перед запуском (export BOT_TOKEN=...).
-# На Render: Dashboard -> ваш сервис -> Environment -> Add Environment Variable.
+# --- Конфигурация из переменных окружения ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
+
+# Render автоматически подставляет RENDER_EXTERNAL_URL, например https://mybot.onrender.com
+# Если переменной нет (локальный запуск), можно задать WEBHOOK_URL вручную.
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")  # опционально, но рекомендуется
+
+# Порт: Render требует, чтобы приложение слушало порт из переменной PORT
+PORT = int(os.environ.get("PORT", 8080))
+HOST = "0.0.0.0"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -120,10 +115,55 @@ async def on_deleted_business_messages(event):
             await bot.send_message(OWNER_ID, caption)
 
 
-async def main():
+async def on_startup(bot: Bot):
+    """Устанавливаем вебхук при старте приложения."""
+    # Формируем полный URL вебхука
+    base_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if not base_url:
+        raise RuntimeError(
+            "Не удалось определить URL для вебхука. "
+            "Задайте переменную WEBHOOK_URL или запустите на Render (RENDER_EXTERNAL_URL)."
+        )
+    webhook_url = f"{base_url.rstrip('/')}{WEBHOOK_PATH}"
+
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,  # на случай перезапуска
+    )
+    logging.info(f"Вебхук установлен: {webhook_url}")
+
+
+async def on_shutdown(bot: Bot):
+    """Удаляем вебхук при остановке (опционально)."""
+    await bot.delete_webhook()
+    logging.info("Вебхук удалён.")
+
+
+def main():
     init_db()
-    await dp.start_polling(bot)
+
+    # Регистрируем startup/shutdown хуки
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    # Создаём aiohttp-приложение
+    app = web.Application()
+
+    # Обработчик вебхука
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    # Подключаем lifecycle-хуки диспетчера к aiohttp
+    setup_application(app, dp, bot=bot)
+
+    # Запускаем сервер на порту, который даёт Render
+    web.run_app(app, host=HOST, port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
