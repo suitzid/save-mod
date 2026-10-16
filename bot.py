@@ -627,7 +627,7 @@ async def start(m: Message):
     inline = render_inline("start", u.id)
     if inline:
         await m.answer(text, reply_markup=inline)
-        await m.answer("⌨️", reply_markup=main_kb(u.id))
+        await m.answer("👇 Меню внизу", reply_markup=main_kb(u.id))
     else:
         await m.answer(text, reply_markup=main_kb(u.id))
 
@@ -1139,7 +1139,10 @@ DEFAULT_LAYOUTS = {
         [_b("n1", "🔕 Тихий режим", "quiet", text_on="🔔 Включить уведомления"),
          _b("n2", "🔇 Замутить", "mute", text_on="🔊 Размутить")],
     ],
-    "start": [],
+    "start": [
+        [_b("i1", "📖 Команды", "help"), _b("i2", "📊 Статистика", "stats")],
+        [_b("i3", "🔌 Подключение", "connect", style="primary"), _b("i4", "⚙️ Админ-панель", "admin")],
+    ],
     "sub": [[_b("s1", "✅ Я подписался", "chk")]],
 }
 ACTIONS = {
