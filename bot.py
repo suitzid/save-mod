@@ -6,7 +6,10 @@ import asyncio
 import sqlite3
 import hashlib
 import logging
+import copy
+import json
 import random
+import secrets
 import ipaddress
 from urllib.parse import urlsplit
 
@@ -21,6 +24,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, BusinessConnection, BusinessMessagesDeleted,
     Update, User, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -193,18 +197,18 @@ def quote(text: str, limit: int = 1500) -> str:
     return f"<blockquote>{html.escape((text or '—')[:limit])}</blockquote>"
 
 
-async def deliver(owner: int, header: str, text: str, mtype, file_id):
+async def deliver(owner: int, header: str, text: str, mtype, file_id, markup=None):
     send = MEDIA_SENDERS.get(mtype)
     has_media = bool(send and file_id)
     caption = header + (f"\n\n{quote(text, 800 if has_media else 3000)}" if text else "")
     if has_media:
         if mtype in ("video_note", "sticker"):
             await send(owner, file_id)
-            await bot.send_message(owner, caption)
+            await bot.send_message(owner, caption, reply_markup=markup)
         else:
-            await send(owner, file_id, caption=caption)
+            await send(owner, file_id, caption=caption, reply_markup=markup)
     else:
-        await bot.send_message(owner, caption)
+        await bot.send_message(owner, caption, reply_markup=markup)
 
 
 async def try_delete(conn_id: str, ids: list[int]):
@@ -253,16 +257,12 @@ async def send_sub_prompt(uid: int, miss, force: bool = False):
     if not force and time.time() - _last_prompt.get(uid, 0) < 600:
         return
     _last_prompt[uid] = time.time()
-    b = InlineKeyboardBuilder()
-    for title, link in miss:
-        b.button(text=f"📌 {title}", url=link)
-    b.button(text="✅ Я подписался", callback_data="chk")
-    b.adjust(1)
+    rows = [[InlineKeyboardButton(text=f"📌 {title}", url=link)] for title, link in miss]
+    extra = render_inline("sub", uid)
+    if extra:
+        rows += extra.inline_keyboard
     try:
-        await bot.send_message(
-            uid, "Чтобы бот работал, подпишись на каналы ниже и нажми «Я подписался».",
-            reply_markup=b.as_markup(),
-        )
+        await bot.send_message(uid, T("sub_prompt"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except Exception:
         log.exception("sub prompt failed")
 
@@ -555,7 +555,7 @@ async def scan_message(m: Message, owner: int, old_text=None):
         links.append((url, label))
 
     if links:
-        lines, has_risk = [f"🔗 {who} отправил ссылку:"], False
+        lines, has_risk = [T("link", user=who)], False
         for url, label in links[:3]:
             score, reasons, notes = analyze_url(url, label)
             if score >= 2:
@@ -580,7 +580,7 @@ async def scan_message(m: Message, owner: int, old_text=None):
         level, reasons = analyze_file(doc.file_name, doc.mime_type)
         if level == 2 or (level == 1 and info_all):
             icon = "⚠️ <b>Опасный тип файла</b>" if level == 2 else "ℹ️ Осторожно"
-            body = [f"📦 {who} отправил файл:", f"<code>{html.escape(doc.file_name or 'без имени')}</code>", icon]
+            body = [T("file", user=who), f"<code>{html.escape(doc.file_name or 'без имени')}</code>", icon]
             body += [f"• {html.escape(x)}" for x in reasons]
             if level == 2:
                 body.append("\nНе открывай и не устанавливай, если не ждал этот файл и не уверен в отправителе.")
@@ -593,7 +593,7 @@ async def scan_message(m: Message, owner: int, old_text=None):
         if reasons:
             bump(owner, "threats")
             outbox.append(
-                f"🚨 {who} — возможное мошенничество:\n{quote(text, 700)}\n"
+                f"{T('scam', user=who)}\n{quote(text, 700)}\n"
                 + "\n".join(f"• {html.escape(x)}" for x in reasons)
             )
 
@@ -601,7 +601,8 @@ async def scan_message(m: Message, owner: int, old_text=None):
         return
     for part in outbox:
         try:
-            await bot.send_message(owner, part, disable_web_page_preview=True)
+            await bot.send_message(owner, part, disable_web_page_preview=True,
+                                   reply_markup=notice_kb(owner, m.chat.id))
         except Exception:
             log.exception("security notice failed")
 
@@ -613,29 +614,57 @@ async def start(m: Message):
     upsert_user(u)
     admin = is_admin(u.id)
     if is_banned(u.id) and not admin:
-        return await m.answer("⛔️ Ты заблокирован.")
+        return await m.answer(T("banned"))
     if not is_enabled() and not admin:
-        return await m.answer("🔴 Бот временно выключен.")
+        return await m.answer(T("disabled"))
     if not admin:
         miss = await missing_channels(u.id)
         if miss:
             return await send_sub_prompt(u.id, miss, force=True)
-    text = (
-        "👋 Я сохраняю удалённые и изменённые сообщения, а ещё предупреждаю об опасных ссылках, "
-        "файлах и мошенниках.\n\n"
-        "Подключение: <b>Настройки → Telegram для бизнеса → Чат-боты</b> → "
-        "выбери меня и дай доступ к чатам.\n\n" + CONNECTED_TEXT +
-        "\n\nКоманды в чатах (с точкой): .help"
-    )
+    text = T("start")
     if admin:
-        text += "\n\n⚙️ Админ-панель: /admin"
-    await m.answer(text)
+        text += "\n\n" + T("admin_hint")
+    inline = render_inline("start", u.id)
+    if inline:
+        await m.answer(text, reply_markup=inline)
+        await m.answer("⌨️", reply_markup=main_kb(u.id))
+    else:
+        await m.answer(text, reply_markup=main_kb(u.id))
+
+
+CONNECT_TEXT = (
+    "🔌 <b>Подключение</b>\n\n"
+    "Настройки → Telegram для бизнеса → Чат-боты → выбери меня и дай доступ к чатам.\n"
+    "Включи права «Ответы на сообщения» и «Удаление сообщений» — без них не работают "
+    "оформление текста, автоответчик, мут и бан."
+)
+
+
+def stats_text(owner: int) -> str:
+    saved = db.execute(
+        "SELECT COUNT(*) FROM msgs WHERE conn_id IN (SELECT id FROM connections WHERE owner_chat_id=?)",
+        (owner,),
+    ).fetchone()[0]
+    return (
+        "📊 <b>Статистика</b>\n"
+        f"Сохранено сообщений: {saved}\n"
+        f"Поймано удалённых: {stat(owner, 'deleted')}\n"
+        f"Поймано правок: {stat(owner, 'edited')}\n"
+        f"Проверено ссылок: {stat(owner, 'links')}\n"
+        f"Угроз найдено: {stat(owner, 'threats')}\n"
+        f"Обычные ссылки: {'вкл' if get_setting(owner, 'info_all') else 'выкл'} · "
+        f"Антискам: {'вкл' if get_setting(owner, 'scam') else 'выкл'}"
+    )
+
+
+def _ok_user(uid: int) -> bool:
+    return is_admin(uid) or (is_enabled() and not is_banned(uid))
 
 
 @dp.message(Command("help"))
 async def help_cmd(m: Message):
     if m.chat.type == "private":
-        await m.answer(HELP_TEXT)
+        await m.answer(T("help"))
 
 
 @dp.callback_query(F.data == "chk")
@@ -645,7 +674,7 @@ async def check_sub(cb: CallbackQuery):
         return await cb.answer("Ты ещё не подписан на все каналы", show_alert=True)
     await cb.answer()
     try:
-        await cb.message.edit_text("✅ Спасибо за подписку!\n\n" + CONNECTED_TEXT)
+        await cb.message.edit_text(T("sub_thanks"))
     except TelegramBadRequest:
         pass
 
@@ -963,20 +992,7 @@ async def handle_command(m: Message, owner: int) -> bool:
             f"Тихий режим: {status_of(ctl_get(owner, chat.id, 'quiet_until'))}"
         )
     elif cmd == "stats":
-        saved = db.execute(
-            "SELECT COUNT(*) FROM msgs WHERE conn_id IN (SELECT id FROM connections WHERE owner_chat_id=?)",
-            (owner,),
-        ).fetchone()[0]
-        reply = (
-            "📊 <b>Статистика</b>\n"
-            f"Сохранено сообщений: {saved}\n"
-            f"Поймано удалённых: {stat(owner, 'deleted')}\n"
-            f"Поймано правок: {stat(owner, 'edited')}\n"
-            f"Проверено ссылок: {stat(owner, 'links')}\n"
-            f"Угроз найдено: {stat(owner, 'threats')}\n"
-            f"Обычные ссылки: {'вкл' if get_setting(owner, 'info_all') else 'выкл'} · "
-            f"Антискам: {'вкл' if get_setting(owner, 'scam') else 'выкл'}"
-        )
+        reply = stats_text(owner)
     elif cmd == "clear":
         cur = db.execute("DELETE FROM msgs WHERE conn_id=? AND chat_id=?", (conn, chat.id))
         db.commit()
@@ -991,7 +1007,7 @@ async def handle_command(m: Message, owner: int) -> bool:
         set_setting(owner, "scam", new)
         reply = "🚨 Антискам включён." if new else "🚨 Антискам выключен."
     elif cmd == "help":
-        reply = HELP_TEXT
+        reply = T("help")
     elif cmd == "save":
         r = m.reply_to_message
         if not r:
@@ -1018,6 +1034,364 @@ async def handle_command(m: Message, owner: int) -> bool:
     return True
 
 
+# ============================== настройка бота: тексты и кнопки ==============================
+TEXT_META = {
+    "start": ("👋 Приветствие (/start)", ""),
+    "help": ("📖 Справка по командам", ""),
+    "connect": ("🔌 Как подключить", ""),
+    "connected": ("✅ Бот подключён", ""),
+    "disconnected": ("🔌 Бот отключён", ""),
+    "sub_prompt": ("📌 Просьба подписаться", ""),
+    "sub_thanks": ("🙏 После подписки", ""),
+    "banned": ("⛔️ Пользователь заблокирован", ""),
+    "disabled": ("🔴 Бот выключен", ""),
+    "deleted": ("🗑 Заголовок: удалил сообщение", "user"),
+    "edited": ("✏️ Заголовок: изменил сообщение", "user"),
+    "was": ("🏷 Подпись «Было»", ""),
+    "now": ("🏷 Подпись «Стало»", ""),
+    "not_saved": ("🗑 Удалено, но не сохранено", "chat"),
+    "link": ("🔗 Заголовок: отправил ссылку", "user"),
+    "file": ("📦 Заголовок: отправил файл", "user"),
+    "scam": ("🚨 Заголовок: мошенничество", "user"),
+    "admin_hint": ("⚙️ Подсказка админу в /start", ""),
+    "admin_added": ("➕ Сообщение новому админу", ""),
+    "admin_removed": ("➖ Сообщение снятому админу", ""),
+}
+PLACEHOLDERS = {
+    "user": "{user} — кто это сделал (@юзернейм или имя)",
+    "chat": "{chat} — имя собеседника",
+}
+DEFAULT_TEXTS = {
+    "start": (
+        "👋 Я сохраняю удалённые и изменённые сообщения, а ещё предупреждаю об опасных ссылках, "
+        "файлах и мошенниках.\n\n"
+        "Подключение: <b>Настройки → Telegram для бизнеса → Чат-боты</b> → "
+        "выбери меня и дай доступ к чатам.\n\n" + CONNECTED_TEXT +
+        "\n\nКоманды в чатах (с точкой): .help"
+    ),
+    "help": HELP_TEXT,
+    "connect": CONNECT_TEXT,
+    "connected": CONNECTED_TEXT + "\n\nКоманды: .help",
+    "disconnected": "🔌 Бот отключён от автоматизации.",
+    "sub_prompt": "Чтобы бот работал, подпишись на каналы ниже и нажми «Я подписался».",
+    "sub_thanks": "✅ Спасибо за подписку!\n\n" + CONNECTED_TEXT,
+    "banned": "⛔️ Ты заблокирован.",
+    "disabled": "🔴 Бот временно выключен.",
+    "deleted": "🗑 {user} удалил сообщение:",
+    "edited": "✏️ {user} изменил сообщение:",
+    "was": "Было:",
+    "now": "Стало:",
+    "not_saved": "🗑 В чате с {chat} удалено сообщение, но бот его не успел сохранить.",
+    "link": "🔗 {user} отправил ссылку:",
+    "file": "📦 {user} отправил файл:",
+    "scam": "🚨 {user} — возможное мошенничество:",
+    "admin_hint": "⚙️ Админ-панель: кнопка внизу или /admin",
+    "admin_added": "⚙️ Тебя назначили админом. Админ-панель — кнопка внизу или /admin",
+    "admin_removed": "Тебя убрали из админов.",
+}
+
+
+def text_raw(key: str):
+    """-> (текст, изменён ли админом)"""
+    r = db.execute("SELECT value FROM settings WHERE key=?", ("text:" + key,)).fetchone()
+    if r and r[0]:
+        return r[0], True
+    return DEFAULT_TEXTS[key], False
+
+
+def T(key: str, **kw) -> str:
+    text, _ = text_raw(key)
+    for k, v in kw.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+def set_text(key: str, val: str):
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("text:" + key, val))
+    db.commit()
+
+
+def reset_text(key: str):
+    db.execute("DELETE FROM settings WHERE key=?", ("text:" + key,))
+    db.commit()
+
+
+STYLE_NAMES = {"primary", "success", "danger"}
+STYLE_LABELS = {"": "⚪️ Без цвета", "primary": "🔵 Синий", "success": "🟢 Зелёный", "danger": "🔴 Красный"}
+
+
+def _b(bid, text, action, value="", style="", text_on=""):
+    return {"id": bid, "text": text, "action": action, "value": value, "style": style, "text_on": text_on}
+
+
+SCREENS = {
+    "kb": "⌨️ Нижняя клавиатура",
+    "notice": "🔔 Под уведомлениями",
+    "start": "🏠 Под сообщением /start",
+    "sub": "📌 Под просьбой подписаться",
+}
+DEFAULT_LAYOUTS = {
+    "kb": [
+        [_b("k1", "📖 Команды", "help"), _b("k2", "📊 Статистика", "stats")],
+        [_b("k3", "🔌 Подключение", "connect"), _b("k4", "⚙️ Админ-панель", "admin")],
+    ],
+    "notice": [
+        [_b("n1", "🔕 Тихий режим", "quiet", text_on="🔔 Включить уведомления"),
+         _b("n2", "🔇 Замутить", "mute", text_on="🔊 Размутить")],
+    ],
+    "start": [],
+    "sub": [[_b("s1", "✅ Я подписался", "chk")]],
+}
+ACTIONS = {
+    "chk": "✅ Проверить подписку",
+    "help": "📖 Справка по командам",
+    "stats": "📊 Статистика",
+    "connect": "🔌 Как подключить",
+    "admin": "⚙️ Админ-панель (только админам)",
+    "quiet": "🔕 Тихий режим чата",
+    "mute": "🔇 Мут собеседника",
+    "reply": "💬 Ответить своим текстом",
+    "url": "🔗 Открыть ссылку",
+}
+SCREEN_ACTIONS = {
+    "kb": ["help", "stats", "connect", "admin", "reply"],
+    "notice": ["quiet", "mute", "help", "stats", "connect", "reply", "url"],
+    "start": ["help", "stats", "connect", "admin", "reply", "url"],
+    "sub": ["chk", "help", "stats", "connect", "reply", "url"],
+}
+TOGGLE_DEFAULT_ON = {"quiet": "🔔 Включить уведомления", "mute": "🔊 Размутить"}
+MAX_ROW, MAX_BTNS = 8, 30
+
+
+def get_layout(screen: str):
+    r = db.execute("SELECT value FROM settings WHERE key=?", ("layout:" + screen,)).fetchone()
+    if r:
+        try:
+            return json.loads(r[0])
+        except ValueError:
+            pass
+    return copy.deepcopy(DEFAULT_LAYOUTS[screen])
+
+
+def save_layout(screen: str, layout):
+    layout = [row for row in layout if row]
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("layout:" + screen, json.dumps(layout, ensure_ascii=False)))
+    db.commit()
+
+
+def reset_layout(screen: str):
+    db.execute("DELETE FROM settings WHERE key=?", ("layout:" + screen,))
+    db.commit()
+
+
+def find_btn(layout, bid: str):
+    for ri, row in enumerate(layout):
+        for ci, b in enumerate(row):
+            if b["id"] == bid:
+                return ri, ci, b
+    return None
+
+
+def move_btn(layout, bid: str, d: str):
+    """Двигает кнопку: l/r — внутри ряда, u/d — между рядами. -> (ok, сообщение)"""
+    f = find_btn(layout, bid)
+    if not f:
+        return False, "Кнопка не найдена"
+    ri, ci, b = f
+    row = layout[ri]
+    if d == "l":
+        if ci == 0:
+            return False, "Дальше влево некуда"
+        row[ci - 1], row[ci] = row[ci], row[ci - 1]
+    elif d == "r":
+        if ci == len(row) - 1:
+            return False, "Дальше вправо некуда"
+        row[ci + 1], row[ci] = row[ci], row[ci + 1]
+    elif d == "u":
+        if ri == 0:
+            if len(row) == 1:
+                return False, "Уже в самом верхнем ряду"
+            row.pop(ci)
+            layout.insert(0, [b])
+        else:
+            if len(layout[ri - 1]) >= MAX_ROW:
+                return False, f"В ряду максимум {MAX_ROW} кнопок"
+            row.pop(ci)
+            layout[ri - 1].insert(min(ci, len(layout[ri - 1])), b)
+    elif d == "d":
+        if ri == len(layout) - 1:
+            if len(row) == 1:
+                return False, "Уже в самом нижнем ряду"
+            row.pop(ci)
+            layout.append([b])
+        else:
+            if len(layout[ri + 1]) >= MAX_ROW:
+                return False, f"В ряду максимум {MAX_ROW} кнопок"
+            row.pop(ci)
+            layout[ri + 1].insert(min(ci, len(layout[ri + 1])), b)
+    layout[:] = [r for r in layout if r]
+    return True, ""
+
+
+def _style(b) -> dict:
+    return {"style": b["style"]} if b.get("style") in STYLE_NAMES else {}
+
+
+def ib(text: str, cb=None, style: str = "", url=None) -> InlineKeyboardButton:
+    kw = {"text": text}
+    if url:
+        kw["url"] = url
+    else:
+        kw["callback_data"] = cb
+    if style in STYLE_NAMES:
+        kw["style"] = style
+    return InlineKeyboardButton(**kw)
+
+
+def kbd(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_inline(screen: str, uid: int, chat_id: int = 0):
+    rows = []
+    for row in get_layout(screen):
+        out = []
+        for b in row:
+            a = b["action"]
+            if a == "admin" and not is_admin(uid):
+                continue
+            if a == "url":
+                if b.get("value"):
+                    out.append(InlineKeyboardButton(text=b["text"], url=b["value"], **_style(b)))
+                continue
+            text = b["text"]
+            if b.get("text_on") and chat_id:
+                if (a == "quiet" and is_quiet(uid, chat_id)) or (a == "mute" and is_silenced(uid, chat_id)):
+                    text = b["text_on"]
+            out.append(InlineKeyboardButton(
+                text=text, callback_data=f"x:{screen}:{b['id']}:{chat_id}", **_style(b)))
+        if out:
+            rows.append(out)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def render_kb(uid: int):
+    rows = []
+    for row in get_layout("kb"):
+        out = [KeyboardButton(text=b["text"], **_style(b)) for b in row
+               if not (b["action"] == "admin" and not is_admin(uid))]
+        if out:
+            rows.append(out)
+    if not rows:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+def main_kb(uid: int):
+    return render_kb(uid)
+
+
+def notice_kb(owner: int, chat_id: int):
+    return render_inline("notice", owner, chat_id)
+
+
+async def perform(action: str, b: dict, uid: int, send):
+    if action == "help":
+        await send(T("help"))
+    elif action == "stats":
+        await send(stats_text(uid))
+    elif action == "connect":
+        await send(T("connect"))
+    elif action == "reply":
+        await send(b.get("value") or "…", disable_web_page_preview=True)
+
+
+class KbPress(BaseFilter):
+    """Срабатывает, когда нажата кнопка нижней клавиатуры."""
+    async def __call__(self, m: Message, state: FSMContext):
+        if m.chat.type != "private" or not m.text or not m.from_user:
+            return False
+        if await state.get_state():
+            return False
+        for row in get_layout("kb"):
+            for b in row:
+                if b["text"] == m.text and not (b["action"] == "admin" and not is_admin(m.from_user.id)):
+                    return {"kbtn": b}
+        return False
+
+
+@dp.message(KbPress())
+async def kb_press(m: Message, kbtn: dict, state: FSMContext):
+    uid = m.from_user.id
+    if not _ok_user(uid):
+        return
+    if kbtn["action"] == "admin":
+        await state.clear()
+        await show_menu(m)
+    else:
+        await perform(kbtn["action"], kbtn, uid, m.answer)
+
+
+@dp.callback_query(F.data.startswith("x:"))
+async def cb_x(cb: CallbackQuery):
+    try:
+        _, screen, bid, ctx = cb.data.split(":", 3)
+        chat_id = int(ctx)
+    except ValueError:
+        return await cb.answer()
+    uid = cb.from_user.id
+    if screen not in DEFAULT_LAYOUTS or not _ok_user(uid):
+        return await cb.answer()
+    found = find_btn(get_layout(screen), bid)
+    if not found:
+        return await cb.answer("Эта кнопка больше не доступна", show_alert=True)
+    b = found[2]
+    a = b["action"]
+    if a in ("quiet", "mute"):
+        if not chat_id:
+            return await cb.answer("Эта кнопка работает только под уведомлениями", show_alert=True)
+        if a == "quiet":
+            if is_quiet(uid, chat_id):
+                ctl_set(uid, chat_id, "quiet_until", 0)
+                note = "🔔 Уведомления из этого чата включены"
+            else:
+                ctl_set(uid, chat_id, "quiet_until", FOREVER)
+                note = "🔕 Тихий режим для этого чата. Вернуть: эта же кнопка или .громко"
+        else:
+            if is_silenced(uid, chat_id):
+                ctl_set(uid, chat_id, "mute_until", 0)
+                ctl_set(uid, chat_id, "banned", 0)
+                note = "🔊 Собеседник размучен"
+            else:
+                ctl_set(uid, chat_id, "mute_until", FOREVER)
+                note = "🔇 Собеседник замучен: его сообщения удаляются (нужно право удалять сообщения)"
+        try:
+            await cb.message.edit_reply_markup(reply_markup=render_inline(screen, uid, chat_id))
+        except TelegramBadRequest:
+            pass
+        await cb.answer(note, show_alert=True)
+    elif a == "chk":
+        if await missing_channels(uid):
+            return await cb.answer("Ты ещё не подписан на все каналы", show_alert=True)
+        await cb.answer()
+        try:
+            await cb.message.edit_text(T("sub_thanks"), reply_markup=None)
+        except TelegramBadRequest:
+            pass
+    elif a == "admin":
+        await cb.answer()
+        if is_admin(uid):
+            await send_menu(uid)
+    else:
+        await cb.answer()
+        await perform(a, b, uid, cb.message.answer)
+
+
+@dp.callback_query(F.data.startswith("n:"))
+async def cb_old_notice(cb: CallbackQuery):
+    await cb.answer("Эти кнопки устарели — они есть под новыми уведомлениями", show_alert=True)
+
+
 # ============================== business ==============================
 _afk_sent: dict[tuple, float] = {}
 
@@ -1029,12 +1403,13 @@ async def on_connection(c: BusinessConnection):
         db.execute("INSERT OR REPLACE INTO connections VALUES (?, ?)", (c.id, c.user_chat_id))
         db.commit()
         if await notify_ok(c.user_chat_id):
-            await bot.send_message(c.user_chat_id, CONNECTED_TEXT + "\n\nКоманды: .help")
+            await bot.send_message(c.user_chat_id, T("connected"),
+                                   reply_markup=main_kb(c.user_chat_id))
     else:
         db.execute("DELETE FROM connections WHERE id=?", (c.id,))
         db.commit()
         try:
-            await bot.send_message(c.user_chat_id, "🔌 Бот отключён от автоматизации.")
+            await bot.send_message(c.user_chat_id, T("disconnected"))
         except Exception:
             pass
 
@@ -1097,9 +1472,10 @@ async def on_edit(m: Message):
             old = row[0] if row else None
             await bot.send_message(
                 owner,
-                f"✏️ {mention(u.id, u.username, u.full_name)} изменил сообщение:\n\n"
-                f"Было:\n{quote(old) if old else '<i>не сохранено</i>'}\n"
-                f"Стало:\n{quote(new_text)}",
+                f"{T('edited', user=mention(u.id, u.username, u.full_name))}\n\n"
+                f"{T('was')}\n{quote(old) if old else '<i>не сохранено</i>'}\n"
+                f"{T('now')}\n{quote(new_text)}",
+                reply_markup=notice_kb(owner, m.chat.id),
             )
             bump(owner, "edited")
 
@@ -1127,15 +1503,16 @@ async def on_deleted(d: BusinessMessagesDeleted):
         if not row:
             await bot.send_message(
                 owner,
-                f"🗑 В чате с {html.escape(d.chat.full_name or str(d.chat.id))} "
-                f"удалено сообщение, но бот его не успел сохранить.",
+                T("not_saved", chat=html.escape(d.chat.full_name or str(d.chat.id))),
+                reply_markup=notice_kb(owner, d.chat.id),
             )
             continue
         uid, username, name, text, mtype, file_id = row
         if uid == owner:
             continue
         try:
-            await deliver(owner, f"🗑 {mention(uid, username, name)} удалил сообщение:", text, mtype, file_id)
+            await deliver(owner, T("deleted", user=mention(uid, username, name)), text, mtype, file_id,
+                          markup=notice_kb(owner, d.chat.id))
             bump(owner, "deleted")
         except Exception:
             log.exception("failed to forward deleted message")
@@ -1160,25 +1537,29 @@ class IsRoot(BaseFilter):
 
 class A(StatesGroup):
     add_admin = State()
-    del_admin = State()
     ban = State()
-    unban = State()
     broadcast = State()
     bc_confirm = State()
     add_channel = State()
+    edit_text = State()
+    btn_text = State()
+    btn_text_on = State()
+    btn_value = State()
+    new_text = State()
+    new_value = State()
 
 
 PROMPTS = {
     "add_admin": ("➕ Пришли ID, @username или перешли сообщение нового админа.", A.add_admin),
-    "del_admin": ("➖ Пришли ID, @username или перешли сообщение админа, которого убрать.", A.del_admin),
-    "ban": ("🚫 Пришли ID, @username или перешли сообщение пользователя для блокировки.", A.ban),
-    "unban": ("✅ Пришли ID, @username или перешли сообщение пользователя для разблокировки.", A.unban),
+    "ban": ("🚫 Пришли ID, @username или перешли сообщение пользователя, которого нужно забанить.", A.ban),
     "add_channel": (
         "➕ Пришли @username канала, ссылку t.me/... или ID (-100...).\n"
         "Бот должен быть админом в этом канале.", A.add_channel),
 }
+BAD_INPUT = "Не понял. Пришли ID, @username или перешли сообщение. /cancel — отмена"
 
 
+# ---------- общие помощники ----------
 def user_label(uid: int, viewer: int) -> str:
     r = db.execute("SELECT username, name FROM users WHERE id=?", (uid,)).fetchone()
     hid = is_hidden(uid)
@@ -1189,96 +1570,17 @@ def user_label(uid: int, viewer: int) -> str:
     return f"{name}{un} <code>{uid}</code>" + (" 🕶" if hid else "") + (" 👑" if uid == ROOT_ADMIN else "")
 
 
+def short_name(uid: int, viewer: int) -> str:
+    if is_hidden(uid) and viewer != ROOT_ADMIN:
+        return "Скрытый"
+    r = db.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()
+    return (r[0] if r and r[0] else str(uid))[:18]
+
+
 def ref(uid: int, viewer: int) -> str:
     if is_hidden(uid) and viewer != ROOT_ADMIN:
         return "Пользователь"
     return f"<code>{uid}</code>"
-
-
-def panel_text() -> str:
-    users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    banned = db.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
-    chans = db.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
-    admins = db.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
-    return (
-        "⚙️ <b>Админ-панель</b>\n\n"
-        f"Статус: {'🟢 включён' if is_enabled() else '🔴 выключен'}\n"
-        f"Пользователей: {users}\nАдминов: {admins}\n"
-        f"Заблокировано: {banned}\nКаналов подписки: {chans}"
-    )
-
-
-def menu_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Добавить админа", callback_data="adm:ask:add_admin")
-    b.button(text="➖ Удалить админа", callback_data="adm:ask:del_admin")
-    b.button(text="🚫 Заблокировать", callback_data="adm:ask:ban")
-    b.button(text="✅ Разблокировать", callback_data="adm:ask:unban")
-    b.button(text="📢 Рассылка", callback_data="adm:bc")
-    b.button(text="📌 Обяз. подписка", callback_data="adm:subs")
-    b.button(text="👥 Админы", callback_data="adm:admins")
-    b.button(
-        text="🔴 Выключить бота" if is_enabled() else "🟢 Включить бота",
-        callback_data="adm:toggle",
-    )
-    b.adjust(2, 2, 2, 2)
-    return b.as_markup()
-
-
-def subs_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for chat_id, title, _ in db.execute("SELECT chat_id, title, link FROM channels"):
-        b.button(text=f"🗑 {title}", callback_data=f"adm:subdel:{chat_id}")
-    b.button(text="➕ Добавить канал", callback_data="adm:ask:add_channel")
-    b.button(text="⬅️ Назад", callback_data="adm:menu")
-    b.adjust(1)
-    return b.as_markup()
-
-
-async def show(ev, text: str, kb: InlineKeyboardMarkup):
-    if isinstance(ev, CallbackQuery):
-        try:
-            await ev.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-        except TelegramBadRequest:
-            pass
-        await ev.answer()
-    else:
-        await ev.answer(text, reply_markup=kb, disable_web_page_preview=True)
-
-
-async def show_menu(ev):
-    await show(ev, panel_text(), menu_kb())
-
-
-async def send_menu(chat_id: int):
-    await bot.send_message(chat_id, panel_text(), reply_markup=menu_kb())
-
-
-async def show_admins(ev):
-    viewer = ev.from_user.id
-    ids = [r[0] for r in db.execute("SELECT id FROM admins")]
-    lst = "\n".join(f"• {user_label(i, viewer)}" for i in ids)
-    b = InlineKeyboardBuilder()
-    text = f"👥 <b>Админы</b>\n\n{lst}"
-    if viewer == ROOT_ADMIN:
-        text += ("\n\n🕶 — у такого админа другие админы не видят ID и @username. "
-                 "Кнопки ниже переключают это.")
-        for i in ids:
-            r = db.execute("SELECT name FROM users WHERE id=?", (i,)).fetchone()
-            nm = (r[0] if r and r[0] else str(i))[:24]
-            b.button(
-                text=(f"👁 Показать: {nm}" if is_hidden(i) else f"🕶 Скрыть: {nm}"),
-                callback_data=f"adm:hide:{i}",
-            )
-    b.button(text="⬅️ Назад", callback_data="adm:menu")
-    b.adjust(1)
-    await show(ev, text, b.as_markup())
-
-
-async def show_subs(ev):
-    rows = db.execute("SELECT title, link FROM channels").fetchall()
-    lst = "\n".join(f"• <a href=\"{l}\">{html.escape(t)}</a>" for t, l in rows) or "Каналов нет."
-    await show(ev, f"📌 <b>Обязательная подписка</b>\n\n{lst}\n\nНажми на канал, чтобы удалить.", subs_kb())
 
 
 def get_target(m: Message):
@@ -1294,7 +1596,49 @@ def get_target(m: Message):
     return int(r.group()) if r else None
 
 
-BAD_INPUT = "Не понял. Пришли ID, @username или перешли сообщение. /cancel — отмена"
+async def show(ev, text: str, kb, answered: bool = False):
+    if isinstance(ev, CallbackQuery):
+        try:
+            await ev.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        except TelegramBadRequest:
+            pass
+        if not answered:
+            try:
+                await ev.answer()
+            except TelegramBadRequest:
+                pass
+    else:
+        await ev.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+def back_row(cb: str = "adm:menu"):
+    return [ib("⬅️ Назад", cb)]
+
+
+# ---------- главное меню (7 кнопок) ----------
+def panel_text() -> str:
+    return (
+        "⚙️ <b>Админ-панель</b>\n\n"
+        f"Статус бота: {'🟢 включён' if is_enabled() else '🔴 выключен'}"
+    )
+
+
+def menu_kb():
+    en = is_enabled()
+    return kbd([
+        [ib("👥 Админы", "adm:admins"), ib("📊 Статистика", "adm:stats")],
+        [ib("🛠 Изменить бота", "adm:edit", "primary"), ib("🚫 Баны", "adm:bans", "danger")],
+        [ib("📢 Рассылка", "adm:bc"), ib("📌 Обяз. подписка", "adm:subs")],
+        [ib("🔴 Выключить бота" if en else "🟢 Включить бота", "adm:toggle", "danger" if en else "success")],
+    ])
+
+
+async def show_menu(ev):
+    await show(ev, panel_text(), menu_kb())
+
+
+async def send_menu(chat_id: int):
+    await bot.send_message(chat_id, panel_text(), reply_markup=menu_kb())
 
 
 @dp.message(IsAdmin(), Command("admin"))
@@ -1315,29 +1659,6 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await show_menu(cb)
 
 
-@dp.callback_query(IsAdmin(), F.data == "adm:admins")
-async def cb_admins(cb: CallbackQuery):
-    await show_admins(cb)
-
-
-@dp.callback_query(IsRoot(), F.data.startswith("adm:hide:"))
-async def cb_hide(cb: CallbackQuery):
-    uid = int(cb.data.split(":")[2])
-    if is_admin(uid):
-        if is_hidden(uid):
-            db.execute("DELETE FROM hidden WHERE id=?", (uid,))
-        else:
-            db.execute("INSERT OR IGNORE INTO hidden VALUES (?)", (uid,))
-        db.commit()
-    await show_admins(cb)
-
-
-@dp.callback_query(IsAdmin(), F.data == "adm:subs")
-async def cb_subs(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await show_subs(cb)
-
-
 @dp.callback_query(IsAdmin(), F.data == "adm:toggle")
 async def cb_toggle(cb: CallbackQuery):
     db.execute("UPDATE settings SET value=? WHERE key='enabled'", ("0" if is_enabled() else "1",))
@@ -1356,17 +1677,67 @@ async def cb_ask(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@dp.callback_query(IsAdmin(), F.data.startswith("adm:subdel:"))
-async def cb_subdel(cb: CallbackQuery):
-    db.execute("DELETE FROM channels WHERE chat_id=?", (int(cb.data.split(":")[2]),))
-    db.commit()
-    await show_subs(cb)
-
-
-async def done(m: Message, state: FSMContext, text: str, to=None):
+async def finish(m: Message, state: FSMContext, text: str, to=None):
     await state.clear()
     await m.answer(text)
     await (to or show_menu)(m)
+
+
+# ---------- 👥 Админы ----------
+async def show_admins(ev):
+    viewer = ev.from_user.id
+    ids = [r[0] for r in db.execute("SELECT id FROM admins")]
+    lst = "\n".join(f"• {user_label(i, viewer)}" for i in ids)
+    text = f"👥 <b>Админы</b>\n\n{lst}\n\n❌ — убрать из админов"
+    rows = []
+    for i in ids:
+        nm = short_name(i, viewer)
+        row = []
+        if i != ROOT_ADMIN:
+            row.append(ib(f"❌ {nm}", f"adm:rm:{i}", "danger"))
+        if viewer == ROOT_ADMIN:
+            row.append(ib(f"👁 {nm}" if is_hidden(i) else f"🕶 {nm}", f"adm:hide:{i}"))
+        if row:
+            rows.append(row)
+    if viewer == ROOT_ADMIN:
+        text += "\n🕶 — скрыть ID и @username админа от других админов, 👁 — показать"
+    rows.append([ib("➕ Добавить админа", "adm:ask:add_admin", "success")])
+    rows.append(back_row())
+    await show(ev, text, kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data == "adm:admins")
+async def cb_admins(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_admins(cb)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("adm:rm:"))
+async def cb_rm_admin(cb: CallbackQuery):
+    uid = int(cb.data.split(":")[2])
+    if uid == ROOT_ADMIN:
+        return await cb.answer("Главного админа убрать нельзя", show_alert=True)
+    db.execute("DELETE FROM admins WHERE id=?", (uid,))
+    db.execute("DELETE FROM hidden WHERE id=?", (uid,))
+    db.commit()
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
+        await bot.send_message(uid, T("admin_removed"), reply_markup=main_kb(uid))
+    except Exception:
+        pass
+    await show_admins(cb)
+
+
+@dp.callback_query(IsRoot(), F.data.startswith("adm:hide:"))
+async def cb_hide(cb: CallbackQuery):
+    uid = int(cb.data.split(":")[2])
+    if is_admin(uid):
+        if is_hidden(uid):
+            db.execute("DELETE FROM hidden WHERE id=?", (uid,))
+        else:
+            db.execute("INSERT OR IGNORE INTO hidden VALUES (?)", (uid,))
+        db.commit()
+    await show_admins(cb)
 
 
 @dp.message(IsAdmin(), A.add_admin)
@@ -1378,27 +1749,72 @@ async def st_add_admin(m: Message, state: FSMContext):
     db.commit()
     await set_admin_menu(uid)
     try:
-        await bot.send_message(uid, "⚙️ Тебя назначили админом. Панель: /admin")
+        await bot.send_message(uid, T("admin_added"), reply_markup=main_kb(uid))
     except Exception:
         pass
-    await done(m, state, f"✅ {ref(uid, m.from_user.id)} теперь админ.")
+    await finish(m, state, f"✅ {ref(uid, m.from_user.id)} теперь админ.", show_admins)
 
 
-@dp.message(IsAdmin(), A.del_admin)
-async def st_del_admin(m: Message, state: FSMContext):
-    uid = get_target(m)
-    if not uid:
-        return await m.answer(BAD_INPUT)
-    if uid == ROOT_ADMIN:
-        return await done(m, state, "⛔️ Главного админа удалить нельзя.")
-    db.execute("DELETE FROM admins WHERE id=?", (uid,))
-    db.execute("DELETE FROM hidden WHERE id=?", (uid,))
+# ---------- 📊 Статистика ----------
+def _total(key: str) -> int:
+    return db.execute("SELECT COALESCE(SUM(n),0) FROM stats WHERE key=?", (key,)).fetchone()[0]
+
+
+def global_stats() -> str:
+    def c(q, *a):
+        return db.execute(q, a).fetchone()[0]
+    now = int(time.time())
+    return (
+        "📊 <b>Статистика</b>\n\n"
+        f"👤 Пользователей: {c('SELECT COUNT(*) FROM users')}\n"
+        f"🔌 Подключённых аккаунтов: {c('SELECT COUNT(*) FROM connections')}\n"
+        f"👥 Админов: {c('SELECT COUNT(*) FROM admins')}\n"
+        f"🚫 Забанено: {c('SELECT COUNT(*) FROM banned')}\n"
+        f"📌 Каналов подписки: {c('SELECT COUNT(*) FROM channels')}\n\n"
+        f"💾 Сохранено сообщений: {c('SELECT COUNT(*) FROM msgs')}\n"
+        f"🗑 Поймано удалённых: {_total('deleted')}\n"
+        f"✏️ Поймано правок: {_total('edited')}\n"
+        f"🔗 Проверено ссылок: {_total('links')}\n"
+        f"⚠️ Угроз найдено: {_total('threats')}\n\n"
+        f"🔇 Собеседников в муте/бане: "
+        f"{c('SELECT COUNT(*) FROM chat_ctl WHERE banned=1 OR mute_until>?', now)}\n"
+        f"💤 Автоответчиков включено: {c('SELECT COUNT(*) FROM afk')}\n"
+        f"Статус бота: {'🟢 включён' if is_enabled() else '🔴 выключен'}\n\n"
+        f"<i>Обновлено {time.strftime('%H:%M:%S', time.gmtime())} UTC</i>"
+    )
+
+
+@dp.callback_query(IsAdmin(), F.data == "adm:stats")
+async def cb_stats(cb: CallbackQuery):
+    await show(cb, global_stats(), kbd([[ib("🔄 Обновить", "adm:stats", "primary")], back_row()]))
+
+
+# ---------- 🚫 Баны ----------
+async def show_bans(ev):
+    ids = [r[0] for r in db.execute("SELECT id FROM banned LIMIT 30")]
+    lines, rows = [], []
+    for i in ids:
+        r = db.execute("SELECT username, name FROM users WHERE id=?", (i,)).fetchone()
+        nm = (r[1] if r and r[1] else str(i))
+        lines.append(f"• {html.escape(nm)}" + (f" @{r[0]}" if r and r[0] else "") + f" <code>{i}</code>")
+        rows.append([ib(f"✅ Разбанить: {nm[:20]}", f"adm:unban:{i}", "success")])
+    text = "🚫 <b>Баны</b>\n\n" + ("\n".join(lines) if lines else "Список пуст.")
+    rows.append([ib("🚫 Забанить пользователя", "adm:ask:ban", "danger")])
+    rows.append(back_row())
+    await show(ev, text, kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data == "adm:bans")
+async def cb_bans(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_bans(cb)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("adm:unban:"))
+async def cb_unban(cb: CallbackQuery):
+    db.execute("DELETE FROM banned WHERE id=?", (int(cb.data.split(":")[2]),))
     db.commit()
-    try:
-        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
-    except Exception:
-        pass
-    await done(m, state, f"✅ {ref(uid, m.from_user.id)} больше не админ.")
+    await show_bans(cb)
 
 
 @dp.message(IsAdmin(), A.ban)
@@ -1407,20 +1823,38 @@ async def st_ban(m: Message, state: FSMContext):
     if not uid:
         return await m.answer(BAD_INPUT)
     if is_admin(uid):
-        return await done(m, state, "⛔️ Админа заблокировать нельзя. Сначала убери из админов.")
+        return await finish(m, state, "⛔️ Админа забанить нельзя. Сначала убери его из админов.", show_bans)
     db.execute("INSERT OR IGNORE INTO banned VALUES (?)", (uid,))
     db.commit()
-    await done(m, state, f"🚫 {ref(uid, m.from_user.id)} заблокирован.")
+    await finish(m, state, f"🚫 {ref(uid, m.from_user.id)} забанен.", show_bans)
 
 
-@dp.message(IsAdmin(), A.unban)
-async def st_unban(m: Message, state: FSMContext):
-    uid = get_target(m)
-    if not uid:
-        return await m.answer(BAD_INPUT)
-    db.execute("DELETE FROM banned WHERE id=?", (uid,))
+# ---------- 📌 Обязательная подписка ----------
+def subs_kb():
+    rows = [[ib(f"🗑 {t}", f"adm:subdel:{cid}", "danger")]
+            for cid, t, _ in db.execute("SELECT chat_id, title, link FROM channels")]
+    rows.append([ib("➕ Добавить канал", "adm:ask:add_channel", "success")])
+    rows.append(back_row())
+    return kbd(rows)
+
+
+async def show_subs(ev):
+    rows = db.execute("SELECT title, link FROM channels").fetchall()
+    lst = "\n".join(f"• <a href=\"{l}\">{html.escape(t)}</a>" for t, l in rows) or "Каналов нет."
+    await show(ev, f"📌 <b>Обязательная подписка</b>\n\n{lst}\n\nНажми на канал, чтобы удалить.", subs_kb())
+
+
+@dp.callback_query(IsAdmin(), F.data == "adm:subs")
+async def cb_subs(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_subs(cb)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("adm:subdel:"))
+async def cb_subdel(cb: CallbackQuery):
+    db.execute("DELETE FROM channels WHERE chat_id=?", (int(cb.data.split(":")[2]),))
     db.commit()
-    await done(m, state, f"✅ {ref(uid, m.from_user.id)} разблокирован.")
+    await show_subs(cb)
 
 
 @dp.message(IsAdmin(), A.add_channel)
@@ -1442,10 +1876,10 @@ async def st_add_channel(m: Message, state: FSMContext):
         return await m.answer(f"Не получилось: {html.escape(str(e))}\n/cancel — отмена")
     db.execute("INSERT OR REPLACE INTO channels VALUES (?,?,?)", (chat.id, chat.title or str(chat.id), link))
     db.commit()
-    await done(m, state, f"✅ Канал «{html.escape(chat.title or '')}» добавлен.", to=show_subs)
+    await finish(m, state, f"✅ Канал «{html.escape(chat.title or '')}» добавлен.", show_subs)
 
 
-# ---------- рассылка: кнопка → сообщение → превью → подтверждение ----------
+# ---------- 📢 Рассылка: кнопка → сообщение → превью → подтверждение ----------
 def bc_recipients() -> list[int]:
     return [r[0] for r in db.execute("SELECT id FROM users WHERE id NOT IN (SELECT id FROM banned)")]
 
@@ -1457,7 +1891,7 @@ async def cb_bc(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text(
             "📢 <b>Рассылка</b>\n\n"
             f"Получат: {len(bc_recipients())} чел. — все, кто запускал бота или подключал его "
-            "(кроме заблокированных).\n\n"
+            "(кроме забаненных).\n\n"
             "1) Пришли мне сообщение для рассылки — любое: текст, фото, видео, с форматированием.\n"
             "2) Я покажу, как оно будет выглядеть.\n"
             "3) Нажмёшь «Отправить» — и оно уйдёт всем.\n\n"
@@ -1473,11 +1907,10 @@ async def st_broadcast(m: Message, state: FSMContext):
     await state.update_data(chat_id=m.chat.id, message_id=m.message_id)
     await state.set_state(A.bc_confirm)
     await m.copy_to(m.chat.id)  # превью
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Отправить", callback_data="adm:bc_send")
-    b.button(text="❌ Отмена", callback_data="adm:menu")
-    b.adjust(2)
-    await m.answer(f"👆 Так увидят получатели. Отправить {len(bc_recipients())} чел.?", reply_markup=b.as_markup())
+    await m.answer(
+        f"👆 Так увидят получатели. Отправить {len(bc_recipients())} чел.?",
+        reply_markup=kbd([[ib("✅ Отправить", "adm:bc_send", "success"), ib("❌ Отмена", "adm:menu", "danger")]]),
+    )
 
 
 @dp.callback_query(IsAdmin(), A.bc_confirm, F.data == "adm:bc_send")
@@ -1505,6 +1938,520 @@ async def cb_bc_send(cb: CallbackQuery, state: FSMContext):
         await asyncio.sleep(0.05)
     await bot.send_message(cb.from_user.id, f"📢 Рассылка завершена.\nДоставлено: {ok}\nНе доставлено: {fail}")
     await send_menu(cb.from_user.id)
+
+
+# ---------- 🛠 Изменить бота ----------
+async def show_edit_menu(ev):
+    await show(
+        ev,
+        "🛠 <b>Изменить бота</b>\n\n"
+        "📝 <b>Тексты</b> — все сообщения, которые присылает бот.\n"
+        "⌨️ <b>Кнопки</b> — текст, действие и цвет кнопок, новые кнопки и их место.",
+        kbd([[ib("📝 Тексты", "ed:t", "primary"), ib("⌨️ Кнопки", "ed:bs", "primary")], back_row()]),
+    )
+
+
+@dp.callback_query(IsAdmin(), F.data == "adm:edit")
+async def cb_edit(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_edit_menu(cb)
+
+
+# --- тексты ---
+async def show_texts(ev):
+    rows = [[ib(("✏️ " if text_raw(k)[1] else "") + TEXT_META[k][0], f"ed:tk:{k}")] for k in TEXT_META]
+    rows.append(back_row("adm:edit"))
+    await show(ev, "📝 <b>Тексты бота</b>\n\n✏️ — текст уже изменён. Выбери, какой менять:", kbd(rows))
+
+
+async def show_text_card(ev, key: str):
+    title, ph = TEXT_META[key]
+    cur, custom = text_raw(key)
+    text = f"{title}\nСтатус: {'✏️ изменён' if custom else 'стандартный'}\n"
+    if ph:
+        text += f"Подстановка: <code>{html.escape(PLACEHOLDERS[ph])}</code>\n"
+    text += f"\n<pre>{html.escape(cur)[:2800]}</pre>"
+    rows = [[ib("✏️ Изменить", f"ed:te:{key}", "primary"), ib("👁 Предпросмотр", f"ed:tp:{key}")]]
+    if custom:
+        rows.append([ib("↩️ Вернуть стандартный", f"ed:tr:{key}", "danger")])
+    rows.append(back_row("ed:t"))
+    await show(ev, text, kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data == "ed:t")
+async def cb_texts(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_texts(cb)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:tk:"))
+async def cb_text_card(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":")[2]
+    if key not in TEXT_META:
+        return await cb.answer()
+    await state.clear()
+    await show_text_card(cb, key)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:te:"))
+async def cb_text_edit(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":")[2]
+    if key not in TEXT_META:
+        return await cb.answer()
+    await state.set_state(A.edit_text)
+    await state.update_data(key=key)
+    ph = TEXT_META[key][1]
+    try:
+        await cb.message.edit_text(
+            f"✏️ <b>{TEXT_META[key][0]}</b>\n\nПришли новый текст одним сообщением. "
+            "Форматирование Telegram (жирный, курсив, ссылки) сохранится."
+            + (f"\nПодстановка: <code>{html.escape(PLACEHOLDERS[ph])}</code> — вставь её туда, где она нужна." if ph else "")
+            + "\n\n/cancel — отмена"
+        )
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+
+@dp.message(IsAdmin(), A.edit_text)
+async def st_edit_text(m: Message, state: FSMContext):
+    key = (await state.get_data()).get("key")
+    if key not in TEXT_META or not m.text:
+        return await m.answer("Пришли текст сообщением. /cancel — отмена")
+    val = m.html_text
+    if len(val) > 3800:
+        return await m.answer("Слишком длинно (максимум ~3800 символов). Сократи и пришли ещё раз.")
+    set_text(key, val)
+    await state.clear()
+    await m.answer("✅ Текст сохранён.")
+    await show_text_card(m, key)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:tp:"))
+async def cb_text_preview(cb: CallbackQuery):
+    key = cb.data.split(":")[2]
+    if key not in TEXT_META:
+        return await cb.answer()
+    await cb.answer()
+    try:
+        await cb.message.answer(T(key, user="@example", chat="Иван"))
+    except TelegramBadRequest as e:
+        await cb.message.answer(f"Не получилось показать: {html.escape(str(e))}")
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:tr:"))
+async def cb_text_reset(cb: CallbackQuery):
+    key = cb.data.split(":")[2]
+    if key in TEXT_META:
+        reset_text(key)
+    await show_text_card(cb, key)
+
+
+# --- кнопки: список экранов и редактор экрана ---
+async def show_screens(ev):
+    rows = [[ib(title, f"ed:s:{s}")] for s, title in SCREENS.items()]
+    rows.append(back_row("adm:edit"))
+    await show(ev, "⌨️ <b>Кнопки бота</b>\n\nВыбери, какие кнопки менять:", kbd(rows))
+
+
+async def show_screen(ev, screen: str):
+    layout = get_layout(screen)
+    lines = [f"{i + 1}) " + " · ".join(b["text"] for b in row) for i, row in enumerate(layout)] or ["(кнопок нет)"]
+    text = (f"<b>{SCREENS[screen]}</b>\n\n{html.escape(chr(10).join(lines))}\n\n"
+            "Нажми на кнопку, чтобы изменить её: текст, действие, цвет, место.")
+    rows = [[ib(b["text"], f"ed:b:{screen}:{b['id']}", b.get("style", "")) for b in row] for row in layout]
+    rows.append([ib("➕ Добавить кнопку", f"ed:nb:{screen}", "success")])
+    rows.append([ib("↩️ Сбросить к стандарту", f"ed:sr:{screen}", "danger"), ib("⬅️ Назад", "ed:bs")])
+    await show(ev, text, kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data == "ed:bs")
+async def cb_screens(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_screens(cb)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:s:"))
+async def cb_screen(cb: CallbackQuery, state: FSMContext):
+    s = cb.data.split(":")[2]
+    if s not in SCREENS:
+        return await cb.answer()
+    await state.clear()
+    await show_screen(cb, s)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:sr:"))
+async def cb_screen_reset(cb: CallbackQuery):
+    s = cb.data.split(":")[2]
+    if s in SCREENS:
+        reset_layout(s)
+        await show_screen(cb, s)
+    else:
+        await cb.answer()
+
+
+# --- карточка кнопки ---
+def _split(cb_data: str, n: int):
+    parts = cb_data.split(":")
+    return parts[2:2 + n] if len(parts) >= 2 + n and parts[2] in SCREENS else None
+
+
+async def show_btn(ev, screen: str, bid: str):
+    layout = get_layout(screen)
+    f = find_btn(layout, bid)
+    if not f:
+        return await show(ev, "Кнопка не найдена.", kbd([back_row(f"ed:s:{screen}")]))
+    ri, ci, b = f
+    a = b["action"]
+    text = (
+        f"🔘 <b>Кнопка «{html.escape(b['text'])}»</b>\n"
+        f"Экран: {SCREENS[screen]}\n"
+        f"Действие: {ACTIONS.get(a, a)}\n"
+    )
+    if a in ("url", "reply"):
+        text += f"{'Ссылка' if a == 'url' else 'Ответ'}: {html.escape((b.get('value') or '—')[:200])}\n"
+    if a in ("quiet", "mute"):
+        text += f"Текст когда включено: {html.escape(b.get('text_on') or '—')}\n"
+    text += f"Цвет: {STYLE_LABELS.get(b.get('style', ''), '⚪️ Без цвета')}\nМесто: ряд {ri + 1}, позиция {ci + 1}"
+    p = f"{screen}:{bid}"
+    rows = [[ib("✏️ Текст", f"ed:bt:{p}"), ib("🎯 Действие", f"ed:ba:{p}")]]
+    extra = []
+    if a in ("url", "reply"):
+        extra.append(ib("✏️ Ссылка" if a == "url" else "✏️ Ответ", f"ed:bv:{p}"))
+    if a in ("quiet", "mute"):
+        extra.append(ib("✏️ Текст «включено»", f"ed:bto:{p}"))
+    extra.append(ib("🎨 Цвет", f"ed:bc:{p}", b.get("style", "")))
+    rows.append(extra)
+    rows.append([ib("⬅️", f"ed:mv:{p}:l"), ib("⬆️", f"ed:mv:{p}:u"),
+                 ib("⬇️", f"ed:mv:{p}:d"), ib("➡️", f"ed:mv:{p}:r")])
+    rows.append([ib("🗑 Удалить", f"ed:bd:{p}", "danger"), ib("⬅️ Назад", f"ed:s:{screen}")])
+    await show(ev, text, kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:b:"))
+async def cb_btn(cb: CallbackQuery, state: FSMContext):
+    sp = _split(cb.data, 2)
+    if not sp:
+        return await cb.answer()
+    await state.clear()
+    await show_btn(cb, *sp)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:mv:"))
+async def cb_move(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    if len(parts) != 5 or parts[2] not in SCREENS or parts[4] not in ("l", "r", "u", "d"):
+        return await cb.answer()
+    screen, bid, d = parts[2], parts[3], parts[4]
+    layout = get_layout(screen)
+    ok, msg = move_btn(layout, bid, d)
+    if not ok:
+        return await cb.answer(msg, show_alert=True)
+    save_layout(screen, layout)
+    await show_btn(cb, screen, bid)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:bd:"))
+async def cb_btn_delete(cb: CallbackQuery):
+    sp = _split(cb.data, 2)
+    if not sp:
+        return await cb.answer()
+    screen, bid = sp
+    layout = get_layout(screen)
+    for row in layout:
+        row[:] = [b for b in row if b["id"] != bid]
+    save_layout(screen, layout)
+    await show_screen(cb, screen)
+
+
+# --- изменить текст / «текст включено» / значение ---
+async def _ask_btn_field(cb: CallbackQuery, state: FSMContext, st, prompt: str):
+    sp = _split(cb.data, 2)
+    if not sp:
+        return await cb.answer()
+    await state.set_state(st)
+    await state.update_data(screen=sp[0], bid=sp[1])
+    try:
+        await cb.message.edit_text(prompt + "\n\n/cancel — отмена")
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:bt:"))
+async def cb_bt(cb: CallbackQuery, state: FSMContext):
+    await _ask_btn_field(cb, state, A.btn_text, "✏️ Пришли новый текст кнопки (до 60 символов, эмодзи можно).")
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:bto:"))
+async def cb_bto(cb: CallbackQuery, state: FSMContext):
+    await _ask_btn_field(cb, state, A.btn_text_on,
+                         "✏️ Пришли текст, который кнопка покажет, когда режим включён (до 60 символов).")
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:bv:"))
+async def cb_bv(cb: CallbackQuery, state: FSMContext):
+    sp = _split(cb.data, 2)
+    f = find_btn(get_layout(sp[0]), sp[1]) if sp else None
+    if not f:
+        return await cb.answer()
+    prompt = ("🔗 Пришли ссылку (https://... или tg://...)." if f[2]["action"] == "url"
+              else "💬 Пришли текст, которым бот ответит при нажатии (форматирование Telegram сохранится).")
+    await _ask_btn_field(cb, state, A.btn_value, prompt)
+
+
+def valid_btn_text(t: str) -> bool:
+    return bool(t) and len(t) <= 60 and "\n" not in t
+
+
+def valid_url(u: str) -> bool:
+    return bool(re.fullmatch(r"(https?|tg)://\S+", u or ""))
+
+
+async def _update_btn(screen: str, bid: str, **fields) -> bool:
+    layout = get_layout(screen)
+    f = find_btn(layout, bid)
+    if not f:
+        return False
+    f[2].update(fields)
+    save_layout(screen, layout)
+    return True
+
+
+@dp.message(IsAdmin(), A.btn_text)
+async def st_btn_text(m: Message, state: FSMContext):
+    t = (m.text or "").strip()
+    if not valid_btn_text(t):
+        return await m.answer("Нужен короткий текст в одну строку (до 60 символов). /cancel — отмена")
+    d = await state.get_data()
+    await _update_btn(d["screen"], d["bid"], text=t)
+    await state.clear()
+    await show_btn(m, d["screen"], d["bid"])
+
+
+@dp.message(IsAdmin(), A.btn_text_on)
+async def st_btn_text_on(m: Message, state: FSMContext):
+    t = (m.text or "").strip()
+    if not valid_btn_text(t):
+        return await m.answer("Нужен короткий текст в одну строку (до 60 символов). /cancel — отмена")
+    d = await state.get_data()
+    await _update_btn(d["screen"], d["bid"], text_on=t)
+    await state.clear()
+    await show_btn(m, d["screen"], d["bid"])
+
+
+@dp.message(IsAdmin(), A.btn_value)
+async def st_btn_value(m: Message, state: FSMContext):
+    d = await state.get_data()
+    f = find_btn(get_layout(d["screen"]), d["bid"])
+    if not f or not m.text:
+        await state.clear()
+        return await m.answer("Кнопка не найдена.")
+    if f[2]["action"] == "url":
+        val = m.text.strip()
+        if not valid_url(val):
+            return await m.answer("Нужна ссылка вида https://... или tg://... /cancel — отмена")
+    else:
+        val = m.html_text
+        if len(val) > 3500:
+            return await m.answer("Слишком длинно. Сократи и пришли ещё раз.")
+    await _update_btn(d["screen"], d["bid"], value=val)
+    await state.clear()
+    await show_btn(m, d["screen"], d["bid"])
+
+
+# --- смена действия ---
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:ba:"))
+async def cb_ba(cb: CallbackQuery):
+    sp = _split(cb.data, 2)
+    if not sp:
+        return await cb.answer()
+    screen, bid = sp
+    rows = [[ib(ACTIONS[a], f"ed:sa:{screen}:{bid}:{a}")] for a in SCREEN_ACTIONS[screen]]
+    rows.append(back_row(f"ed:b:{screen}:{bid}"))
+    await show(cb, "🎯 <b>Что делает кнопка при нажатии?</b>", kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:sa:"))
+async def cb_sa(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    if len(parts) != 5 or parts[2] not in SCREENS or parts[4] not in SCREEN_ACTIONS[parts[2]]:
+        return await cb.answer()
+    screen, bid, a = parts[2], parts[3], parts[4]
+    fields = {"action": a}
+    if a in TOGGLE_DEFAULT_ON:
+        fields["text_on"] = TOGGLE_DEFAULT_ON[a]
+    if a not in ("url", "reply"):
+        fields["value"] = ""
+    if not await _update_btn(screen, bid, **fields):
+        return await cb.answer("Кнопка не найдена", show_alert=True)
+    if a in ("url", "reply"):
+        await state.set_state(A.btn_value)
+        await state.update_data(screen=screen, bid=bid)
+        try:
+            await cb.message.edit_text(
+                ("🔗 Пришли ссылку (https://... или tg://...)." if a == "url"
+                 else "💬 Пришли текст, которым бот ответит при нажатии.") + "\n\n/cancel — отмена")
+        except TelegramBadRequest:
+            pass
+        return await cb.answer()
+    await show_btn(cb, screen, bid)
+
+
+# --- цвет ---
+def _color_rows(prefix: str):
+    return [[ib(label, f"{prefix}:{key or 'none'}", key)] for key, label in STYLE_LABELS.items()]
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:bc:"))
+async def cb_bc_color(cb: CallbackQuery):
+    sp = _split(cb.data, 2)
+    if not sp:
+        return await cb.answer()
+    screen, bid = sp
+    rows = _color_rows(f"ed:sc:{screen}:{bid}")
+    rows.append(back_row(f"ed:b:{screen}:{bid}"))
+    await show(cb, "🎨 <b>Цвет кнопки</b>\n\n<i>Цвета видны в свежих версиях Telegram.</i>", kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:sc:"))
+async def cb_sc(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    if len(parts) != 5 or parts[2] not in SCREENS:
+        return await cb.answer()
+    screen, bid, st = parts[2], parts[3], parts[4]
+    st = "" if st == "none" else st
+    if st and st not in STYLE_NAMES:
+        return await cb.answer()
+    await _update_btn(screen, bid, style=st)
+    await show_btn(cb, screen, bid)
+
+
+# --- мастер новой кнопки: текст → действие → (значение) → цвет → место ---
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:nb:"))
+async def cb_new_btn(cb: CallbackQuery, state: FSMContext):
+    s = cb.data.split(":")[2]
+    if s not in SCREENS:
+        return await cb.answer()
+    if sum(len(r) for r in get_layout(s)) >= MAX_BTNS:
+        return await cb.answer(f"Максимум {MAX_BTNS} кнопок на экране", show_alert=True)
+    await state.clear()
+    await state.set_state(A.new_text)
+    await state.update_data(screen=s)
+    try:
+        await cb.message.edit_text("➕ <b>Новая кнопка</b>\n\nШаг 1. Пришли текст кнопки (до 60 символов, эмодзи можно).\n\n/cancel — отмена")
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+
+@dp.message(IsAdmin(), A.new_text)
+async def st_new_text(m: Message, state: FSMContext):
+    t = (m.text or "").strip()
+    if not valid_btn_text(t):
+        return await m.answer("Нужен короткий текст в одну строку (до 60 символов). /cancel — отмена")
+    await state.update_data(ntext=t)
+    await state.set_state(None)
+    s = (await state.get_data())["screen"]
+    rows = [[ib(ACTIONS[a], f"ed:na:{a}")] for a in SCREEN_ACTIONS[s]]
+    rows.append([ib("❌ Отмена", "adm:edit", "danger")])
+    await m.answer("Шаг 2. <b>Что делает кнопка при нажатии?</b>", reply_markup=kbd(rows))
+
+
+async def _new_color_step(ev):
+    rows = _color_rows("ed:ns")
+    rows.append([ib("❌ Отмена", "adm:edit", "danger")])
+    await show(ev, "Шаг 3. <b>Цвет кнопки</b>\n\n<i>Цвета видны в свежих версиях Telegram.</i>", kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:na:"))
+async def cb_new_action(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    a = cb.data.split(":")[2]
+    s = d.get("screen")
+    if not s or not d.get("ntext") or a not in SCREEN_ACTIONS.get(s, []):
+        return await cb.answer("Сессия устарела — начни добавление заново", show_alert=True)
+    await state.update_data(naction=a, nvalue="")
+    if a in ("url", "reply"):
+        await state.set_state(A.new_value)
+        try:
+            await cb.message.edit_text(
+                ("Шаг 2б. Пришли ссылку (https://... или tg://...)." if a == "url"
+                 else "Шаг 2б. Пришли текст, которым бот ответит при нажатии.") + "\n\n/cancel — отмена")
+        except TelegramBadRequest:
+            pass
+        return await cb.answer()
+    await _new_color_step(cb)
+
+
+@dp.message(IsAdmin(), A.new_value)
+async def st_new_value(m: Message, state: FSMContext):
+    d = await state.get_data()
+    if not m.text:
+        return await m.answer("Пришли текстом. /cancel — отмена")
+    if d.get("naction") == "url":
+        val = m.text.strip()
+        if not valid_url(val):
+            return await m.answer("Нужна ссылка вида https://... или tg://... /cancel — отмена")
+    else:
+        val = m.html_text
+        if len(val) > 3500:
+            return await m.answer("Слишком длинно. Сократи и пришли ещё раз.")
+    await state.update_data(nvalue=val)
+    await state.set_state(None)
+    await _new_color_step(m)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:ns:"))
+async def cb_new_style(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    st = cb.data.split(":")[2]
+    st = "" if st == "none" else st
+    if not d.get("screen") or not d.get("naction") or (st and st not in STYLE_NAMES):
+        return await cb.answer("Сессия устарела — начни добавление заново", show_alert=True)
+    await state.update_data(nstyle=st)
+    layout = get_layout(d["screen"])
+    rows = [[ib("⬆️ Новый ряд сверху", "ed:np:top")]]
+    for i, row in enumerate(layout):
+        names = " · ".join(b["text"] for b in row)[:30]
+        rows.append([ib(f"Ряд {i + 1}: добавить справа ({names})", f"ed:np:{i}")])
+    rows.append([ib("⬇️ Новый ряд снизу", "ed:np:new")])
+    rows.append([ib("❌ Отмена", "adm:edit", "danger")])
+    await show(cb, "Шаг 4. <b>Куда поставить кнопку?</b>", kbd(rows))
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("ed:np:"))
+async def cb_new_place(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pos = cb.data.split(":")[2]
+    s = d.get("screen")
+    if not s or not d.get("ntext") or not d.get("naction"):
+        return await cb.answer("Сессия устарела — начни добавление заново", show_alert=True)
+    layout = get_layout(s)
+    if sum(len(r) for r in layout) >= MAX_BTNS:
+        return await cb.answer(f"Максимум {MAX_BTNS} кнопок на экране", show_alert=True)
+    a = d["naction"]
+    b = _b(secrets.token_hex(3), d["ntext"], a, d.get("nvalue", ""), d.get("nstyle", ""),
+           TOGGLE_DEFAULT_ON.get(a, ""))
+    if pos == "top":
+        layout.insert(0, [b])
+    elif pos == "new":
+        layout.append([b])
+    else:
+        try:
+            i = int(pos)
+        except ValueError:
+            return await cb.answer()
+        if i >= len(layout):
+            layout.append([b])
+        elif len(layout[i]) >= MAX_ROW:
+            return await cb.answer(f"В ряду максимум {MAX_ROW} кнопок — выбери другой ряд", show_alert=True)
+        else:
+            layout[i].append(b)
+    save_layout(s, layout)
+    await state.clear()
+    await cb.answer("✅ Кнопка добавлена")
+    await show_screen(cb, s)
 
 
 # ============================== запуск ==============================
