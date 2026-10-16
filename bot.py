@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 import hashlib
 import logging
+import random
 import ipaddress
 from urllib.parse import urlsplit
 
@@ -19,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, BusinessConnection, BusinessMessagesDeleted,
-    Update, User, InlineKeyboardMarkup,
+    Update, User, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -60,10 +61,12 @@ CREATE TABLE IF NOT EXISTS hidden (id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, name TEXT);
 CREATE TABLE IF NOT EXISTS channels (chat_id INTEGER PRIMARY KEY, title TEXT, link TEXT);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS chat_state (
-    owner INTEGER, chat_id INTEGER, muted_until INTEGER DEFAULT 0, banned INTEGER DEFAULT 0,
+CREATE TABLE IF NOT EXISTS chat_ctl (
+    owner INTEGER, chat_id INTEGER,
+    mute_until INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, quiet_until INTEGER DEFAULT 0,
     PRIMARY KEY (owner, chat_id)
 );
+CREATE TABLE IF NOT EXISTS afk (owner INTEGER PRIMARY KEY, text TEXT, since INTEGER);
 CREATE TABLE IF NOT EXISTS owner_settings (
     owner INTEGER PRIMARY KEY, info_all INTEGER DEFAULT 1, scam INTEGER DEFAULT 1
 );
@@ -100,40 +103,27 @@ def upsert_user(u: User):
     db.commit()
 
 
-# --- состояние чатов (.mute / .ban) ---
-def _ensure_chat(owner: int, chat_id: int):
-    db.execute("INSERT OR IGNORE INTO chat_state (owner, chat_id) VALUES (?,?)", (owner, chat_id))
+# --- состояние чатов: .mute / .ban (удаляем сообщения собеседника), .quiet (тишина уведомлений) ---
+def ctl_get(owner: int, chat_id: int, field: str) -> int:
+    assert field in ("mute_until", "banned", "quiet_until")
+    r = db.execute(f"SELECT {field} FROM chat_ctl WHERE owner=? AND chat_id=?", (owner, chat_id)).fetchone()
+    return (r[0] or 0) if r else 0
 
 
-def is_muted(owner: int, chat_id: int) -> bool:
-    r = db.execute(
-        "SELECT muted_until FROM chat_state WHERE owner=? AND chat_id=?", (owner, chat_id)
-    ).fetchone()
-    return bool(r and r[0] > time.time())
-
-
-def mute_until(owner: int, chat_id: int) -> int:
-    r = db.execute(
-        "SELECT muted_until FROM chat_state WHERE owner=? AND chat_id=?", (owner, chat_id)
-    ).fetchone()
-    return r[0] if r else 0
-
-
-def set_muted(owner: int, chat_id: int, until: int):
-    _ensure_chat(owner, chat_id)
-    db.execute("UPDATE chat_state SET muted_until=? WHERE owner=? AND chat_id=?", (until, owner, chat_id))
+def ctl_set(owner: int, chat_id: int, field: str, val: int):
+    assert field in ("mute_until", "banned", "quiet_until")
+    db.execute("INSERT OR IGNORE INTO chat_ctl (owner, chat_id) VALUES (?,?)", (owner, chat_id))
+    db.execute(f"UPDATE chat_ctl SET {field}=? WHERE owner=? AND chat_id=?", (int(val), owner, chat_id))
     db.commit()
 
 
-def is_chat_banned(owner: int, chat_id: int) -> bool:
-    r = db.execute("SELECT banned FROM chat_state WHERE owner=? AND chat_id=?", (owner, chat_id)).fetchone()
-    return bool(r and r[0])
+def is_silenced(owner: int, chat_id: int) -> bool:
+    """Собеседник замучен или забанен — его новые сообщения удаляем."""
+    return bool(ctl_get(owner, chat_id, "banned")) or ctl_get(owner, chat_id, "mute_until") > time.time()
 
 
-def set_chat_banned(owner: int, chat_id: int, val: bool):
-    _ensure_chat(owner, chat_id)
-    db.execute("UPDATE chat_state SET banned=? WHERE owner=? AND chat_id=?", (int(val), owner, chat_id))
-    db.commit()
+def is_quiet(owner: int, chat_id: int) -> bool:
+    return ctl_get(owner, chat_id, "quiet_until") > time.time()
 
 
 # --- личные настройки владельца ---
@@ -642,6 +632,12 @@ async def start(m: Message):
     await m.answer(text)
 
 
+@dp.message(Command("help"))
+async def help_cmd(m: Message):
+    if m.chat.type == "private":
+        await m.answer(HELP_TEXT)
+
+
 @dp.callback_query(F.data == "chk")
 async def check_sub(cb: CallbackQuery):
     miss = await missing_channels(cb.from_user.id)
@@ -655,40 +651,93 @@ async def check_sub(cb: CallbackQuery):
 
 
 # ============================== команды в чате ==============================
-ALIASES = {
-    ".mute": "mute", ".мут": "mute",
-    ".unmute": "unmute", ".анмут": "unmute", ".размут": "unmute",
-    ".ban": "ban", ".бан": "ban",
-    ".unban": "unban", ".разбан": "unban", ".анбан": "unban",
-    ".save": "save", ".сохр": "save", ".сохранить": "save",
-    ".info": "info", ".инфо": "info",
-    ".stats": "stats", ".стата": "stats", ".стат": "stats", ".статистика": "stats",
-    ".clear": "clear", ".очистить": "clear",
-    ".links": "links", ".ссылки": "links",
-    ".scam": "scam", ".скам": "scam", ".антискам": "scam",
-    ".ping": "ping", ".пинг": "ping",
-    ".help": "help", ".хелп": "help", ".помощь": "help", ".команды": "help",
+ALIASES: dict[str, str] = {}
+
+
+def _alias(cmd: str, *names: str):
+    for n in names:
+        ALIASES["." + n] = cmd
+
+
+_alias("mute", "mute", "мут")
+_alias("unmute", "unmute", "размут", "анмут")
+_alias("ban", "ban", "бан")
+_alias("unban", "unban", "разбан", "анбан")
+_alias("quiet", "quiet", "тихо")
+_alias("unquiet", "unquiet", "громко")
+_alias("love", "love", "лав", "люблю")
+_alias("type", "type", "печать")
+_alias("bold", "bold", "жирный")
+_alias("italic", "italic", "курсив")
+_alias("mono", "mono", "monospace", "моно")
+_alias("underline", "underline", "подчерк")
+_alias("strike", "strike", "зачерк")
+_alias("spoiler", "spoiler", "спойлер")
+_alias("sw", "sw", "раскладка")
+_alias("dice", "dice", "кубик")
+_alias("flip", "flip", "монетка")
+_alias("afk", "afk", "афк")
+_alias("unafk", "unafk", "анафк")
+_alias("check", "check", "чек", "проверить")
+_alias("save", "save", "сохр", "сохранить")
+_alias("info", "info", "инфо")
+_alias("stats", "stats", "стата", "стат", "статистика")
+_alias("clear", "clear", "очистить")
+_alias("links", "links", "ссылки")
+_alias("scam", "scam", "скам", "антискам")
+_alias("help", "help", "хелп", "помощь", "команды")
+
+FORMATS = {
+    "bold": "b", "italic": "i", "mono": "code",
+    "underline": "u", "strike": "s", "spoiler": "tg-spoiler",
 }
 
 HELP_TEXT = (
-    "🛠 <b>Команды</b> — пиши в любом чате с подключённым ботом. "
-    "Сообщение с командой бот постарается удалить, ответ придёт сюда.\n\n"
-    "<code>.mute</code> / <code>.мут</code> [время] — не присылать уведомления об удалении и правках "
-    "в этом чате. Время: <code>.мут 30</code> (мин), <code>2ч</code>, <code>1д</code>; без времени — навсегда\n"
-    "<code>.unmute</code> / <code>.размут</code> — вернуть уведомления\n"
-    "<code>.ban</code> / <code>.бан</code> — удалять все новые сообщения собеседника в этом чате "
-    "(нужно право удалять сообщения в настройках бота)\n"
-    "<code>.unban</code> / <code>.разбан</code> — снять бан\n"
-    "<code>.save</code> / <code>.сохр</code> — ответом на сообщение: пришлю его сюда\n"
-    "<code>.info</code> / <code>.инфо</code> — данные о собеседнике и статус чата\n"
-    "<code>.stats</code> / <code>.стата</code> — статистика бота\n"
-    "<code>.clear</code> / <code>.очистить</code> — стереть сохранённые сообщения этого чата\n"
-    "<code>.links</code> / <code>.ссылки</code> — вкл/выкл уведомления об обычных ссылках и архивах "
-    "(подозрительное и опасное приходит всегда)\n"
-    "<code>.scam</code> / <code>.скам</code> — вкл/выкл предупреждения о мошенничестве в тексте\n"
-    "<code>.ping</code> / <code>.пинг</code> — проверка, что бот жив\n"
-    "<code>.help</code> / <code>.помощь</code> — эта справка"
+    "🛠 <b>Команды</b>\n"
+    "Пиши в любом чате с подключённым ботом, в начале сообщения ставь точку. "
+    "Результат бот подставит прямо в твоё сообщение.\n\n"
+    "💬 <b>Текст</b>\n"
+    "<code>.bold</code> <code>.italic</code> <code>.mono</code> <code>.underline</code> "
+    "<code>.strike</code> <code>.spoiler</code> + текст — оформление\n"
+    "<code>.type</code> текст — печатающая машинка\n"
+    "<code>.sw</code> текст — сменить раскладку (ghbdtn → привет)\n"
+    "<code>.love</code> — сердечки ❤️\n\n"
+    "🎲 <b>Игры</b>\n"
+    "<code>.dice</code> [🎯 🏀 ⚽ 🎳 🎰] — кубик/дартс/мяч · <code>.flip</code> — монетка\n\n"
+    "🔇 <b>Собеседник</b>\n"
+    "<code>.mute</code> / <code>.мут</code> [время] — удалять его новые сообщения "
+    "(<code>.мут 30</code> мин, <code>2ч</code>, <code>1д</code>; без времени — навсегда)\n"
+    "<code>.unmute</code> / <code>.размут</code> — снять мут\n"
+    "<code>.ban</code> / <code>.бан</code> — то же, но бессрочно · <code>.unban</code> / <code>.разбан</code>\n"
+    "<i>Для мута и бана у бота должно быть право удалять сообщения.</i>\n"
+    "<code>.quiet</code> / <code>.тихо</code> [время] — не присылать мне уведомления "
+    "об удалении и правках из этого чата · <code>.unquiet</code> / <code>.громко</code>\n\n"
+    "🛡 <b>Защита</b>\n"
+    "<code>.check</code> / <code>.чек</code> — ответом на сообщение: проверю ссылку, файл и текст\n"
+    "<code>.links</code> — вкл/выкл уведомления об обычных ссылках и архивах\n"
+    "<code>.scam</code> — вкл/выкл предупреждения о мошенничестве\n\n"
+    "📥 <b>Прочее</b>\n"
+    "<code>.save</code> — ответом: пришлю сообщение в личку · <code>.info</code> — о собеседнике\n"
+    "<code>.stats</code> — статистика · <code>.clear</code> — стереть сохранённое в этом чате\n"
+    "<code>.afk</code> [причина] — автоответчик · <code>.unafk</code> — выключить"
 )
+
+NO_RIGHT = (
+    "Не получилось изменить сообщение в чате. Проверь, что у бота включено право "
+    "«Ответы на сообщения» (Настройки → Telegram для бизнеса → Чат-боты)."
+)
+
+_EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~"
+_RU = "йцукенгшщзхъфывапролджэячсмитьбю.ёЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,Ё"
+assert len(_EN) == len(_RU)
+_E2R, _R2E = dict(zip(_EN, _RU)), dict(zip(_RU, _EN))
+
+
+def switch_layout(t: str) -> str:
+    lat = sum(c.isascii() and c.isalpha() for c in t)
+    cyr = sum(("а" <= c.lower() <= "я") or c in "ёЁ" for c in t)
+    mp = _E2R if lat >= cyr else _R2E
+    return "".join(mp.get(c, c) for c in t)
 
 
 def parse_duration(arg: str):
@@ -717,52 +766,201 @@ def fmt_until(ts: int) -> str:
     return f"ещё {max(1, left // 60)} мин."
 
 
+def status_of(ts: int) -> str:
+    return f"да, {fmt_until(ts)}" if ts > time.time() else "нет"
+
+
+async def edit_msg(m: Message, text: str) -> bool:
+    """Заменяем текст командного сообщения владельца."""
+    for _ in range(2):
+        try:
+            await bot.edit_message_text(
+                text, business_connection_id=m.business_connection_id,
+                chat_id=m.chat.id, message_id=m.message_id,
+            )
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return True
+            log.info("edit failed: %s", e)
+            return False
+        except Exception:
+            log.exception("edit failed")
+            return False
+    return False
+
+
+async def edit_or_send(m: Message, text: str) -> bool:
+    """Пробуем отредактировать; если нельзя — отправляем новое сообщение и удаляем команду."""
+    if await edit_msg(m, text):
+        return True
+    try:
+        await bot.send_message(m.chat.id, text, business_connection_id=m.business_connection_id)
+        await try_delete(m.business_connection_id, [m.message_id])
+        return True
+    except Exception:
+        log.exception("send into chat failed")
+        return False
+
+
+async def play(m: Message, frames: list[str], delay: float = 0.8) -> bool:
+    for i, f in enumerate(frames):
+        if not await edit_msg(m, f):
+            return i > 0
+        if i < len(frames) - 1:
+            await asyncio.sleep(delay)
+    return True
+
+
+def check_report(r: Message) -> str:
+    text = r.text or r.caption or ""
+    out, links = [], []
+    for e in (r.entities or r.caption_entities or []):
+        if e.type == "url":
+            links.append((e.extract_from(text), None))
+        elif e.type == "text_link" and e.url:
+            links.append((e.url, e.extract_from(text)))
+    for url, label in links[:3]:
+        score, reasons, notes = analyze_url(url, label)
+        if score >= 2:
+            out.append(f"⚠️ <code>{html.escape(defang(url))}</code> — подозрительная:\n"
+                       + "\n".join(f"• {html.escape(x)}" for x in reasons[:4]))
+        else:
+            out.append(f"🔗 <code>{html.escape(url[:150])}</code> — явных признаков опасности нет"
+                       + (f" ({html.escape('; '.join(notes))})" if notes else ""))
+    if r.document:
+        level, reasons = analyze_file(r.document.file_name, r.document.mime_type)
+        name = html.escape(r.document.file_name or "без имени")
+        if level:
+            out.append(f"📦 <code>{name}</code> — {'⚠️ опасный тип' if level == 2 else 'осторожно'}:\n"
+                       + "\n".join(f"• {html.escape(x)}" for x in reasons))
+        else:
+            out.append(f"📦 <code>{name}</code> — тип файла обычный")
+    sc = scam_reasons(text, has_link=bool(links)) if text else []
+    if sc:
+        out.append("🚨 В тексте похоже на мошенничество:\n" + "\n".join(f"• {html.escape(x)}" for x in sc))
+    if not out:
+        return "🔎 Проверять нечего: в сообщении нет ссылок, файлов и подозрительного текста."
+    return "🔎 <b>Проверка</b>\n\n" + "\n\n".join(out) + "\n\nЭто эвристика, а не гарантия — будь внимателен."
+
+
 async def handle_command(m: Message, owner: int) -> bool:
-    parts = (m.text or "").strip().split()
-    cmd = ALIASES.get(parts[0].lower())
+    parts = (m.text or "").strip().split(None, 1)
+    cmd = ALIASES.get(parts[0].lower()) if parts else None
     if not cmd:
         return False
-    arg = parts[1] if len(parts) > 1 else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
     if not await notify_ok(owner):
         return True
     chat = m.chat
     who = mention(chat.id, chat.username, chat.full_name)
     conn = m.business_connection_id
-    reply = None
+    reply = None     # ответ владельцу в личку
+    keep = False     # True — командное сообщение уже заменено результатом, удалять не надо
+    now = int(time.time())
 
-    if cmd == "mute":
-        if arg:
-            secs = parse_duration(arg)
+    if cmd in FORMATS:
+        if not rest:
+            reply = f"Напиши текст после команды, например: <code>.{parts[0][1:]} привет</code>"
+        else:
+            tag = FORMATS[cmd]
+            keep = await edit_or_send(m, f"<{tag}>{html.escape(rest)}</{tag}>")
+            reply = None if keep else NO_RIGHT
+    elif cmd == "type":
+        if not rest:
+            reply = "Напиши текст после команды: <code>.type привет</code>"
+        else:
+            t = rest[:80]
+            step = max(1, len(t) // 12)
+            frames = [html.escape(t[:i]) + "▌" for i in range(step, len(t), step)] + [html.escape(t)]
+            keep = await play(m, frames, 0.7)
+            reply = None if keep else NO_RIGHT
+    elif cmd == "love":
+        hearts = ["🤍", "💛", "🧡", "❤️", "💖", "💘", "💝", "💕", "❤️‍🔥", "❤️"]
+        keep = await play(m, hearts, 0.8)
+        reply = None if keep else NO_RIGHT
+    elif cmd == "sw":
+        src = rest or ((m.reply_to_message.text or "") if m.reply_to_message else "")
+        if not src:
+            reply = "Напиши текст после команды или ответь ей на сообщение: <code>.sw ghbdtn</code>"
+        else:
+            keep = await edit_or_send(m, html.escape(switch_layout(src)))
+            reply = None if keep else NO_RIGHT
+    elif cmd == "flip":
+        keep = await edit_or_send(m, "🪙 " + random.choice(["Орёл", "Решка"]))
+        reply = None if keep else NO_RIGHT
+    elif cmd == "dice":
+        emoji = rest if rest in ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰") else "🎲"
+        try:
+            await bot.send_dice(chat.id, emoji=emoji, business_connection_id=conn)
+        except Exception:
+            log.exception("send_dice failed")
+            reply = NO_RIGHT
+    elif cmd == "mute":
+        if rest:
+            secs = parse_duration(rest)
             if not secs:
                 reply = "Не понял время. Примеры: <code>.мут 30</code>, <code>.мут 2ч</code>, <code>.мут 1д</code>"
             else:
-                set_muted(owner, chat.id, int(time.time()) + secs)
-                reply = f"🔕 Чат с {who}: уведомления выключены ({fmt_until(int(time.time()) + secs)})."
+                ctl_set(owner, chat.id, "mute_until", now + secs)
+                reply = f"🔇 {who} замучен ({fmt_until(now + secs)}): его новые сообщения будут удаляться."
         else:
-            set_muted(owner, chat.id, FOREVER)
-            reply = f"🔕 Чат с {who}: уведомления выключены навсегда. Вернуть: <code>.размут</code>"
+            ctl_set(owner, chat.id, "mute_until", FOREVER)
+            reply = f"🔇 {who} замучен навсегда: его новые сообщения будут удаляться. Снять: <code>.размут</code>"
+        if reply and reply.startswith("🔇"):
+            reply += "\nУ бота должно быть право удалять сообщения."
     elif cmd == "unmute":
-        set_muted(owner, chat.id, 0)
-        reply = f"🔔 Чат с {who}: уведомления включены."
+        ctl_set(owner, chat.id, "mute_until", 0)
+        reply = f"🔊 {who} размучен."
     elif cmd == "ban":
-        set_chat_banned(owner, chat.id, True)
-        reply = (f"🚫 {who} заблокирован: его новые сообщения в этом чате будут удаляться.\n"
-                 f"Нужно право удалять сообщения у бота в настройках бизнес-чатов.\n"
-                 f"Снять: <code>.разбан</code>")
+        ctl_set(owner, chat.id, "banned", 1)
+        reply = (f"🚫 {who} забанен: его новые сообщения будут удаляться бессрочно. "
+                 f"Снять: <code>.разбан</code>\nУ бота должно быть право удалять сообщения.")
     elif cmd == "unban":
-        set_chat_banned(owner, chat.id, False)
-        reply = f"✅ {who} разблокирован."
+        ctl_set(owner, chat.id, "banned", 0)
+        reply = f"✅ {who} разбанен."
+    elif cmd == "quiet":
+        secs = parse_duration(rest) if rest else FOREVER - now
+        if not secs:
+            reply = "Не понял время. Примеры: <code>.тихо 30</code>, <code>.тихо 2ч</code>"
+        else:
+            ctl_set(owner, chat.id, "quiet_until", now + secs)
+            reply = f"🔕 Чат с {who}: уведомления об удалении и правках выключены ({fmt_until(now + secs)})."
+    elif cmd == "unquiet":
+        ctl_set(owner, chat.id, "quiet_until", 0)
+        reply = f"🔔 Чат с {who}: уведомления включены."
+    elif cmd == "afk":
+        if rest.lower() in ("off", "выкл", "стоп"):
+            db.execute("DELETE FROM afk WHERE owner=?", (owner,))
+            db.commit()
+            reply = "💬 Автоответчик выключен."
+        else:
+            txt = rest or "Я сейчас не на связи, отвечу позже."
+            db.execute("INSERT OR REPLACE INTO afk VALUES (?,?,?)", (owner, txt[:300], now))
+            db.commit()
+            reply = (f"💤 Автоответчик включён. Собеседникам (раз в 30 минут на чат) буду отвечать:\n"
+                     f"{quote(txt, 300)}\nВыключить: <code>.unafk</code>\n"
+                     f"Нужно право «Ответы на сообщения» у бота.")
+    elif cmd == "unafk":
+        db.execute("DELETE FROM afk WHERE owner=?", (owner,))
+        db.commit()
+        reply = "💬 Автоответчик выключен."
+    elif cmd == "check":
+        r = m.reply_to_message
+        reply = check_report(r) if r else "Ответь командой <code>.check</code> на сообщение со ссылкой, файлом или текстом."
     elif cmd == "info":
         cnt = db.execute(
             "SELECT COUNT(*) FROM msgs WHERE conn_id=? AND chat_id=?", (conn, chat.id)
         ).fetchone()[0]
         id_line = "скрыт" if is_hidden(chat.id) else f"<code>{chat.id}</code>"
-        mu = mute_until(owner, chat.id)
         reply = (
             f"👤 <b>Собеседник:</b> {who}\nID: {id_line}\n"
             f"Сохранено сообщений: {cnt}\n"
-            f"Уведомления: {('🔕 выкл, ' + fmt_until(mu)) if mu > time.time() else '🔔 вкл'}\n"
-            f"Бан: {'🚫 да' if is_chat_banned(owner, chat.id) else 'нет'}"
+            f"Мут: {status_of(ctl_get(owner, chat.id, 'mute_until'))}\n"
+            f"Бан: {'да' if ctl_get(owner, chat.id, 'banned') else 'нет'}\n"
+            f"Тихий режим: {status_of(ctl_get(owner, chat.id, 'quiet_until'))}"
         )
     elif cmd == "stats":
         saved = db.execute(
@@ -792,8 +990,6 @@ async def handle_command(m: Message, owner: int) -> bool:
         new = not get_setting(owner, "scam")
         set_setting(owner, "scam", new)
         reply = "🚨 Антискам включён." if new else "🚨 Антискам выключен."
-    elif cmd == "ping":
-        reply = "🏓 pong — бот работает."
     elif cmd == "help":
         reply = HELP_TEXT
     elif cmd == "save":
@@ -817,11 +1013,15 @@ async def handle_command(m: Message, owner: int) -> bool:
             await bot.send_message(owner, reply, disable_web_page_preview=True)
         except Exception:
             log.exception("command reply failed")
-    await try_delete(conn, [m.message_id])
+    if not keep:
+        await try_delete(conn, [m.message_id])
     return True
 
 
 # ============================== business ==============================
+_afk_sent: dict[tuple, float] = {}
+
+
 @dp.business_connection()
 async def on_connection(c: BusinessConnection):
     upsert_user(c.user)
@@ -851,7 +1051,7 @@ async def on_business_message(m: Message):
             return
 
     if u and u.id != owner:
-        if is_chat_banned(owner, m.chat.id):
+        if is_silenced(owner, m.chat.id):
             await try_delete(m.business_connection_id, [m.message_id])
             return
         await scan_message(m, owner)
@@ -864,6 +1064,19 @@ async def on_business_message(m: Message):
          m.text or m.caption or "", mtype, file_id),
     )
     db.commit()
+
+    # автоответчик (.afk)
+    if u and u.id != owner and not u.is_bot:
+        a = db.execute("SELECT text FROM afk WHERE owner=?", (owner,)).fetchone()
+        key = (owner, m.chat.id)
+        if a and time.time() - _afk_sent.get(key, 0) > 1800:
+            _afk_sent[key] = time.time()
+            try:
+                await bot.send_message(
+                    m.chat.id, "💤 " + html.escape(a[0]), business_connection_id=m.business_connection_id
+                )
+            except Exception:
+                log.exception("afk reply failed")
 
 
 @dp.edited_business_message()
@@ -880,7 +1093,7 @@ async def on_edit(m: Message):
 
     if u and u.id != owner:
         await scan_message(m, owner, old_text=row[0] if row else None)
-        if not is_muted(owner, m.chat.id) and await notify_ok(owner):
+        if not is_quiet(owner, m.chat.id) and await notify_ok(owner):
             old = row[0] if row else None
             await bot.send_message(
                 owner,
@@ -903,7 +1116,7 @@ async def on_edit(m: Message):
 @dp.deleted_business_messages()
 async def on_deleted(d: BusinessMessagesDeleted):
     owner = await owner_of(d.business_connection_id)
-    if not owner or is_muted(owner, d.chat.id) or not await notify_ok(owner):
+    if not owner or is_quiet(owner, d.chat.id) or not await notify_ok(owner):
         return
     for mid in d.message_ids:
         row = db.execute(
@@ -1163,6 +1376,7 @@ async def st_add_admin(m: Message, state: FSMContext):
         return await m.answer(BAD_INPUT)
     db.execute("INSERT OR IGNORE INTO admins VALUES (?)", (uid,))
     db.commit()
+    await set_admin_menu(uid)
     try:
         await bot.send_message(uid, "⚙️ Тебя назначили админом. Панель: /admin")
     except Exception:
@@ -1180,6 +1394,10 @@ async def st_del_admin(m: Message, state: FSMContext):
     db.execute("DELETE FROM admins WHERE id=?", (uid,))
     db.execute("DELETE FROM hidden WHERE id=?", (uid,))
     db.commit()
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
+    except Exception:
+        pass
     await done(m, state, f"✅ {ref(uid, m.from_user.id)} больше не админ.")
 
 
@@ -1290,11 +1508,37 @@ async def cb_bc_send(cb: CallbackQuery, state: FSMContext):
 
 
 # ============================== запуск ==============================
+BASE_COMMANDS = [
+    BotCommand(command="start", description="Запуск и подключение"),
+    BotCommand(command="help", description="Список команд"),
+]
+
+
+async def set_admin_menu(uid: int):
+    try:
+        await bot.set_my_commands(
+            BASE_COMMANDS + [BotCommand(command="admin", description="Админ-панель")],
+            scope=BotCommandScopeChat(chat_id=uid),
+        )
+    except Exception:
+        log.info("set_my_commands для %s не удалось (админ ещё не писал боту?)", uid)
+
+
+async def setup_menu():
+    try:
+        await bot.set_my_commands(BASE_COMMANDS)
+    except Exception:
+        log.exception("set_my_commands failed")
+    for (aid,) in db.execute("SELECT id FROM admins").fetchall():
+        await set_admin_menu(aid)
+
+
 async def on_startup(bot: Bot):
     url = f"{BASE_URL.rstrip('/')}{WEBHOOK_PATH}"
     types = dp.resolve_used_update_types()
     await bot.set_webhook(url, secret_token=SECRET, allowed_updates=types, drop_pending_updates=True)
     log.info("Webhook set: %s | allowed: %s", url, types)
+    await setup_menu()
 
 
 def main():
